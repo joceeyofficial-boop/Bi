@@ -2,4 +2,4 @@ requests
 ccxt
 websockets
 pandas
-python-telegram-bot>=21.0
+python-telegram-bot[job-queue]>=21.0
