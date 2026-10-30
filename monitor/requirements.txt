@@ -2,3 +2,4 @@ requests
 ccxt
 websockets
 pandas
+python-telegram-bot>=21.0
