@@ -1,4 +1,0 @@
-requests
-ccxt
-websockets
-pandas
