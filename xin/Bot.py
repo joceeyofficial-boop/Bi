@@ -419,19 +419,34 @@ def format_recheck(p, hours, old_liq):
         f"<a href='{p['url']}'>查看</a>"
     )
 
+def command_loop():
+    """单独线程处理 Telegram 命令，提高响应速度"""
+    while True:
+        try:
+            process_telegram_commands()
+            time.sleep(2)  # 每 2 秒检查一次新消息
+        except Exception as e:
+            print(f"命令处理异常: {e}")
+            time.sleep(5)
+
 def main_loop():
     print("机器人启动中（Gecko发现 + DexScreener精准数据）...")
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("警告：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未设置！")
+    
     send_telegram("🤖 机器人已启动（混合数据源）\n发送 /help 查看可用命令")
+
+    # 启动命令处理线程
+    import threading
+    t = threading.Thread(target=command_loop, daemon=True)
+    t.start()
 
     seen = set(load_json(SEEN_FILE)) if isinstance(load_json(SEEN_FILE), list) else set()
     observe = load_json(OBSERVE_FILE)
 
     while True:
         try:
-            # 1. 处理用户命令
-            process_telegram_commands()
-
-            # 2. 扫描新池（GeckoTerminal）
+            # 扫描新池
             pools = fetch_new_pools(pages=2)
             print(f"[{datetime.now().strftime('%H:%M:%S')}] 扫描到 {len(pools)} 个新池")
 
@@ -453,7 +468,7 @@ def main_loop():
             save_json(SEEN_FILE, list(seen))
             save_json(OBSERVE_FILE, observe)
 
-            # 3. 复检观察列表（用 DexScreener 更准）
+            # 复检
             now = datetime.now(timezone.utc)
             for addr, info in list(observe.items()):
                 first = datetime.fromisoformat(info["first_seen"])
