@@ -6,13 +6,13 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ====================== 配置区 ======================
-TELEGRAM_BOT_TOKEN = "8229035839:AAFfen2rHkpQB6hh1LW9cP8oYkQfoefcK_k"
-TELEGRAM_CHAT_ID = "1085273843"
+TELEGRAM_BOT_TOKEN = ""
+TELEGRAM_CHAT_ID = ""
 
 SCAN_INTERVAL = 90
 SEEN_FILE = "seen_pools.json"
 OBSERVE_FILE = "observe_pools.json"
-WATCH_FILE = "watch_list.json"          # 个人监控列表
+WATCH_FILE = "watch_list.json"
 
 # 严格过滤参数
 MIN_LIQUIDITY_USD = 25000
@@ -26,15 +26,23 @@ MIN_SCORE_TO_PUSH = 68
 RECHECK_HOURS = [12, 24]
 # ====================================================
 
-BASE_URL = "https://api.geckoterminal.com/api/v2"
-HEADERS = {
+# GeckoTerminal（仅用于新池发现）
+GECKO_BASE = "https://api.geckoterminal.com/api/v2"
+GECKO_HEADERS = {
     "Accept": "application/json;version=20230203",
     "User-Agent": "Mozilla/5.0"
 }
-session = requests.Session()
-session.headers.update(HEADERS)
 
-# 全局变量
+# DexScreener（价格/市值/复检，更精准）
+DEX_BASE = "https://api.dexscreener.com"
+DEX_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0"
+}
+
+session = requests.Session()
+session.headers.update(GECKO_HEADERS)
+
 last_update_id = 0
 
 def load_json(path):
@@ -76,30 +84,59 @@ def get_updates():
         pass
     return []
 
+# ====================== DexScreener 精准数据 ======================
 def fetch_token_info(token_address: str):
-    """通过代币地址获取价格和市值等信息"""
-    # 先尝试搜索池子
-    url = f"{BASE_URL}/networks/solana/tokens/{token_address}/pools"
+    """通过代币地址获取最精准的价格、市值、流动性（DexScreener）"""
+    url = f"{DEX_BASE}/latest/dex/tokens/{token_address}"
     try:
-        r = session.get(url, timeout=12)
-        if r.status_code == 200:
-            pools = r.json().get("data", [])
-            if pools:
-                # 取流动性最高的池
-                best = max(pools, key=lambda x: float(x.get("attributes", {}).get("reserve_in_usd", 0) or 0))
-                attr = best.get("attributes", {})
-                return {
-                    "name": attr.get("name", "Unknown"),
-                    "price": float(attr.get("base_token_price_usd", 0) or 0),
-                    "fdv": float(attr.get("fdv_usd", 0) or 0),
-                    "liquidity": float(attr.get("reserve_in_usd", 0) or 0),
-                    "pool_address": attr.get("address", ""),
-                    "url": f"https://www.geckoterminal.com/solana/pools/{attr.get('address', '')}"
-                }
+        r = session.get(url, headers=DEX_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        pairs = data.get("pairs") or []
+        if not pairs:
+            return None
+
+        # 只保留 Solana 且流动性最高的池
+        sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+        if not sol_pairs:
+            sol_pairs = pairs  # 兜底
+
+        best = max(sol_pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0) or 0))
+        
+        base = best.get("baseToken", {})
+        return {
+            "name": f"{base.get('name', 'Unknown')} ({base.get('symbol', '')})",
+            "symbol": base.get("symbol", ""),
+            "price": float(best.get("priceUsd") or 0),
+            "fdv": float(best.get("fdv") or 0),
+            "liquidity": float(best.get("liquidity", {}).get("usd") or 0),
+            "pool_address": best.get("pairAddress", ""),
+            "url": best.get("url") or f"https://dexscreener.com/solana/{best.get('pairAddress', '')}",
+            "volume_24h": float(best.get("volume", {}).get("h24") or 0),
+            "price_change_24h": float(best.get("priceChange", {}).get("h24") or 0)
+        }
     except Exception as e:
-        print(f"获取代币信息失败: {e}")
+        print(f"DexScreener 获取代币信息失败: {e}")
     return None
 
+def fetch_pool_by_address(pool_address: str):
+    """通过池地址获取最新数据（用于复检）"""
+    url = f"{DEX_BASE}/latest/dex/pairs/solana/{pool_address}"
+    try:
+        r = session.get(url, headers=DEX_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        pairs = data.get("pairs") or []
+        if not pairs:
+            return None
+        return pairs[0]  # DexScreener 返回结构与 Gecko 不同，后面统一 parse
+    except Exception as e:
+        print(f"DexScreener 获取池信息失败: {e}")
+    return None
+
+# ====================== 命令处理 ======================
 def handle_command(text: str, chat_id: str):
     text = text.strip()
     watch_list = load_json(WATCH_FILE)
@@ -187,12 +224,16 @@ def handle_command(text: str, chat_id: str):
         addr = parts[1].strip()
         info = fetch_token_info(addr)
         if info:
+            change = info.get("price_change_24h", 0)
+            change_str = f"+{change:.1f}%" if change >= 0 else f"{change:.1f}%"
             send_telegram(
                 f"<b>{info['name']}</b>\n\n"
                 f"价格: <b>${info['price']:.8f}</b>\n"
                 f"市值(FDV): <b>${info['fdv']:,.0f}</b>\n"
-                f"流动性: ${info['liquidity']:,.0f}\n\n"
-                f"<a href='{info['url']}'>GeckoTerminal 查看</a>",
+                f"流动性: ${info['liquidity']:,.0f}\n"
+                f"24h涨跌: {change_str}\n"
+                f"24h成交: ${info.get('volume_24h', 0):,.0f}\n\n"
+                f"<a href='{info['url']}'>DexScreener 查看</a>",
                 chat_id
             )
         else:
@@ -206,7 +247,6 @@ def handle_command(text: str, chat_id: str):
         send_telegram("未知命令，请输入 /help 查看支持的命令", chat_id)
 
 def process_telegram_commands():
-    """处理用户发送的命令"""
     global last_update_id
     updates = get_updates()
     for update in updates:
@@ -217,14 +257,14 @@ def process_telegram_commands():
         if chat_id == TELEGRAM_CHAT_ID and text.startswith("/"):
             handle_command(text, chat_id)
 
-# ------------------- 以下是原来的扫描逻辑（保持不变） -------------------
+# ------------------- 扫描逻辑（新池发现仍用 Gecko，精度更高） -------------------
 def fetch_new_pools(pages=2):
     all_pools = []
     for page in range(1, pages + 1):
-        url = f"{BASE_URL}/networks/solana/new_pools"
+        url = f"{GECKO_BASE}/networks/solana/new_pools"
         params = {"page": page}
         try:
-            r = session.get(url, params=params, timeout=12)
+            r = session.get(url, params=params, headers=GECKO_HEADERS, timeout=12)
             if r.status_code == 200:
                 all_pools.extend(r.json().get("data", []))
         except:
@@ -232,17 +272,8 @@ def fetch_new_pools(pages=2):
         time.sleep(1.1)
     return all_pools
 
-def fetch_pool_by_address(pool_address: str):
-    url = f"{BASE_URL}/networks/solana/pools/{pool_address}"
-    try:
-        r = session.get(url, timeout=12)
-        if r.status_code == 200:
-            return r.json().get("data")
-    except:
-        pass
-    return None
-
-def parse_pool(pool):
+def parse_pool_gecko(pool):
+    """解析 GeckoTerminal 新池数据"""
     try:
         attr = pool.get("attributes", {})
         rel = pool.get("relationships", {})
@@ -267,11 +298,59 @@ def parse_pool(pool):
             age = (datetime.now(timezone.utc) - ct).total_seconds() / 60
 
         return {
-            "name": name, "pool_address": pool_address, "token_address": base_token,
-            "liquidity": liquidity, "fdv": fdv, "vol_m5": vol_m5,
-            "buys_m5": buys, "sells_m5": sells, "buyers_m5": buyers,
+            "name": name,
+            "pool_address": pool_address,
+            "token_address": base_token,
+            "liquidity": liquidity,
+            "fdv": fdv,
+            "vol_m5": vol_m5,
+            "buys_m5": buys,
+            "sells_m5": sells,
+            "buyers_m5": buyers,
             "age_minutes": age,
-            "url": f"https://www.geckoterminal.com/solana/pools/{pool_address}"
+            "url": f"https://dexscreener.com/solana/{pool_address}"
+        }
+    except:
+        return None
+
+def parse_pool_dex(pair):
+    """解析 DexScreener 池数据（用于复检）"""
+    try:
+        base = pair.get("baseToken", {})
+        name = f"{base.get('name', 'Unknown')} ({base.get('symbol', '')})"
+        pool_address = pair.get("pairAddress", "")
+        token_address = base.get("address", "")
+
+        liquidity = float(pair.get("liquidity", {}).get("usd") or 0)
+        fdv = float(pair.get("fdv") or 0)
+        
+        # DexScreener 的 m5 数据
+        txns = pair.get("txns", {}).get("m5", {})
+        buys = int(txns.get("buys") or 0)
+        sells = int(txns.get("sells") or 0)
+        buyers = buys  # DexScreener 没有单独 buyers，用 buys 近似
+        
+        vol_m5 = float(pair.get("volume", {}).get("m5") or 0)
+
+        created = pair.get("pairCreatedAt")
+        age = 999
+        if created:
+            # pairCreatedAt 是毫秒时间戳
+            ct = datetime.fromtimestamp(created / 1000, tz=timezone.utc)
+            age = (datetime.now(timezone.utc) - ct).total_seconds() / 60
+
+        return {
+            "name": name,
+            "pool_address": pool_address,
+            "token_address": token_address,
+            "liquidity": liquidity,
+            "fdv": fdv,
+            "vol_m5": vol_m5,
+            "buys_m5": buys,
+            "sells_m5": sells,
+            "buyers_m5": buyers,
+            "age_minutes": age,
+            "url": pair.get("url") or f"https://dexscreener.com/solana/{pool_address}"
         }
     except:
         return None
@@ -326,7 +405,7 @@ def format_primary(p, score):
         f"买/卖: {p['buys_m5']}/{p['sells_m5']} | 买家{p['buyers_m5']}\n"
         f"买/卖比: <b>{br:.2f}</b>\n"
         f"5m成交: ${p['vol_m5']:,.0f}\n\n"
-        f"<a href='{p['url']}'>GeckoTerminal</a>\n"
+        f"<a href='{p['url']}'>DexScreener</a>\n"
         f"<code>{p['pool_address']}</code>"
     )
 
@@ -341,8 +420,8 @@ def format_recheck(p, hours, old_liq):
     )
 
 def main_loop():
-    print("机器人启动中（自动扫描 + 个人监控）...")
-    send_telegram("🤖 机器人已启动\n发送 /help 查看可用命令")
+    print("机器人启动中（Gecko发现 + DexScreener精准数据）...")
+    send_telegram("🤖 机器人已启动（混合数据源）\n发送 /help 查看可用命令")
 
     seen = set(load_json(SEEN_FILE)) if isinstance(load_json(SEEN_FILE), list) else set()
     observe = load_json(OBSERVE_FILE)
@@ -352,12 +431,12 @@ def main_loop():
             # 1. 处理用户命令
             process_telegram_commands()
 
-            # 2. 扫描新池
+            # 2. 扫描新池（GeckoTerminal）
             pools = fetch_new_pools(pages=2)
             print(f"[{datetime.now().strftime('%H:%M:%S')}] 扫描到 {len(pools)} 个新池")
 
             for pool in pools:
-                p = parse_pool(pool)
+                p = parse_pool_gecko(pool)
                 if not p or p["pool_address"] in seen: continue
                 if not hard_filter(p): continue
                 score = score_pool(p)
@@ -374,7 +453,7 @@ def main_loop():
             save_json(SEEN_FILE, list(seen))
             save_json(OBSERVE_FILE, observe)
 
-            # 3. 复检观察列表
+            # 3. 复检观察列表（用 DexScreener 更准）
             now = datetime.now(timezone.utc)
             for addr, info in list(observe.items()):
                 first = datetime.fromisoformat(info["first_seen"])
@@ -384,7 +463,7 @@ def main_loop():
                     if hours >= h:
                         raw = fetch_pool_by_address(addr)
                         if raw:
-                            np = parse_pool(raw)
+                            np = parse_pool_dex(raw)
                             if np and is_still_healthy(info, np):
                                 send_telegram(format_recheck(np, h, info["liquidity"]))
                         info.setdefault("rechecks_done", []).append(h)
