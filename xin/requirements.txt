@@ -1,3 +1,1 @@
-python-telegram-bot
 requests
-# 其他你代码里用到的库
