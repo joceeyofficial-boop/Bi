@@ -602,7 +602,7 @@ def main_loop():
                 if not p or p["pool_address"] in seen: continue
                 if not hard_filter(p): continue
                 score = score_pool(p)
-                                if score >= MIN_SCORE_TO_PUSH:
+                if score >= MIN_SCORE_TO_PUSH:
                     # 二次确认：用 DexScreener 检查真实流动性
                     real_liq = 0
                     real_name = p["name"]
