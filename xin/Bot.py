@@ -1,39 +1,41 @@
 import time
 import requests
 import json
+import os
 import threading
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ====================== 配置区 ======================
-TELEGRAM_BOT_TOKEN = "8229035839:AAFfen2rHkpQB6hh1LW9cP8oYkQfoefcK_k"
-TELEGRAM_CHAT_ID = "1085273843"
+TELEGRAM_BOT_TOKEN = os.getenv("8229035839:AAFfen2rHkpQB6hh1LW9cP8oYkQfoefcK_k", "")
+TELEGRAM_CHAT_ID = os.getenv("1085273843", "")
 
 SCAN_INTERVAL = 90
 SEEN_FILE = "seen_pools.json"
 OBSERVE_FILE = "observe_pools.json"
 WATCH_FILE = "watch_list.json"
+ALERT_FILE = "alert_list.json"
 
-# 严格过滤参数
-MIN_LIQUIDITY_USD = 25000
-MIN_AGE_MINUTES = 8
-MAX_AGE_MINUTES = 180
-MIN_BUY_RATIO = 1.25
-MAX_FDV_LIQ_RATIO = 18
-MIN_BUYERS_M5 = 15
-MIN_VOLUME_M5 = 8000
-MIN_SCORE_TO_PUSH = 68
+ALERT_CHECK_INTERVAL = 180  # 个人提醒检查间隔（秒）= 3分钟
+
+# ---------- 已放宽的过滤参数 ----------
+MIN_LIQUIDITY_USD = 15000       # 原25000 → 15000
+MIN_AGE_MINUTES = 5             # 原8 → 5
+MAX_AGE_MINUTES = 240           # 原180 → 240
+MIN_BUY_RATIO = 1.15            # 原1.25 → 1.15
+MAX_FDV_LIQ_RATIO = 25          # 原18 → 25
+MIN_BUYERS_M5 = 10              # 原15 → 10
+MIN_VOLUME_M5 = 5000            # 原8000 → 5000
+MIN_SCORE_TO_PUSH = 58          # 原68 → 58
 RECHECK_HOURS = [12, 24]
 # ====================================================
 
-# GeckoTerminal（仅用于新池发现）
 GECKO_BASE = "https://api.geckoterminal.com/api/v2"
 GECKO_HEADERS = {
     "Accept": "application/json;version=20230203",
     "User-Agent": "Mozilla/5.0"
 }
 
-# DexScreener（价格/市值/复检，更精准）
 DEX_BASE = "https://api.dexscreener.com"
 DEX_HEADERS = {
     "Accept": "application/json",
@@ -57,6 +59,19 @@ def load_json(path):
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+def format_mcap(value):
+    """市值格式化成 K / M"""
+    try:
+        value = float(value)
+        if value >= 1_000_000:
+            return f"{value/1_000_000:.2f}M"
+        elif value >= 1_000:
+            return f"{value/1_000:.1f}K"
+        else:
+            return f"{value:.0f}"
+    except:
+        return "0"
 
 def send_telegram(text, chat_id=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -84,16 +99,12 @@ def get_updates():
         pass
     return []
 
-# ====================== DexScreener 精准数据 ======================
+# ====================== DexScreener ======================
 def fetch_token_info(token_address: str):
-    """通过代币地址获取最精准的价格、市值、流动性（DexScreener，带备用方案）"""
     token_address = token_address.strip()
-    
-    # 方案1：优先用 tokens 接口
     urls = [
         f"{DEX_BASE}/latest/dex/tokens/{token_address}",
         f"{DEX_BASE}/token-pairs/v1/solana/{token_address}",
-        f"{DEX_BASE}/tokens/v1/solana/{token_address}"
     ]
     
     for url in urls:
@@ -103,14 +114,12 @@ def fetch_token_info(token_address: str):
                 continue
             data = r.json()
             
-            # 兼容不同接口返回结构
             pairs = data.get("pairs") or data.get("pair") or []
             if isinstance(pairs, dict):
                 pairs = [pairs]
             if not pairs:
                 continue
 
-            # 只保留 Solana 且流动性最高的池
             sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
             if not sol_pairs:
                 sol_pairs = pairs
@@ -121,11 +130,14 @@ def fetch_token_info(token_address: str):
             name = base.get("name") or "Unknown"
             symbol = base.get("symbol") or ""
             
+            # 优先取流通市值
+            mcap = float(best.get("marketCap") or best.get("fdv") or 0)
+            
             return {
                 "name": f"{name} ({symbol})",
                 "symbol": symbol,
                 "price": float(best.get("priceUsd") or 0),
-                "fdv": float(best.get("marketCap") or best.get("fdv") or 0),  # 优先取流通市值
+                "fdv": mcap,
                 "liquidity": float(best.get("liquidity", {}).get("usd") or 0),
                 "pool_address": best.get("pairAddress", ""),
                 "url": best.get("url") or f"https://dexscreener.com/solana/{best.get('pairAddress', '')}",
@@ -135,11 +147,9 @@ def fetch_token_info(token_address: str):
         except Exception as e:
             print(f"查询失败 {url}: {e}")
             continue
-    
     return None
 
 def fetch_pool_by_address(pool_address: str):
-    """通过池地址获取最新数据（用于复检）"""
     url = f"{DEX_BASE}/latest/dex/pairs/solana/{pool_address}"
     try:
         r = session.get(url, headers=DEX_HEADERS, timeout=12)
@@ -149,9 +159,9 @@ def fetch_pool_by_address(pool_address: str):
         pairs = data.get("pairs") or []
         if not pairs:
             return None
-        return pairs[0]  # DexScreener 返回结构与 Gecko 不同，后面统一 parse
+        return pairs[0]
     except Exception as e:
-        print(f"DexScreener 获取池信息失败: {e}")
+        print(f"获取池信息失败: {e}")
     return None
 
 # ====================== 命令处理 ======================
@@ -163,14 +173,18 @@ def handle_command(text: str, chat_id: str):
         msg = (
             "<b>🤖 新B-扫 机器人</b>\n\n"
             "【自动扫描】\n"
-            "后台持续扫描新池，严格过滤后推送\n"
+            "后台持续扫描新池，过滤后推送\n"
             "并通过12h/24h复检二次提醒\n\n"
             "【个人监控命令】\n"
             "/watch 合约地址 - 添加监控\n"
             "/unwatch 合约地址 - 删除监控\n"
-            "/list - 查看监控列表\n"
+            "/list - 查看监控列表（含实时价格）\n"
             "/price 合约地址 - 查看即时价格市值\n"
-            "/clear - 清空所有监控\n"
+            "/clear - 清空所有监控\n\n"
+            "【市值提醒】\n"
+            "/alert 合约地址 目标K - 设置市值提醒\n"
+            "/alerts - 查看当前提醒\n"
+            "/unalert 合约地址 - 取消提醒\n\n"
             "/status - 运行状态\n"
             "/help - 显示帮助"
         )
@@ -178,9 +192,11 @@ def handle_command(text: str, chat_id: str):
 
     elif text.startswith("/status"):
         observe = load_json(OBSERVE_FILE)
+        alerts = load_json(ALERT_FILE)
         msg = (
             f"<b>📊 运行状态</b>\n\n"
             f"个人监控数量: {len(watch_list)}\n"
+            f"市值提醒数量: {len(alerts)}\n"
             f"自动观察中: {len(observe)}\n"
             f"当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
@@ -204,8 +220,8 @@ def handle_command(text: str, chat_id: str):
                 f"✅ 已添加监控\n\n"
                 f"<b>{info['name']}</b>\n"
                 f"价格: ${info['price']:.8f}\n"
-                f"流通市值: ${info['fdv']:,.0f}\n"
-                f"流动性: ${info['liquidity']:,.0f}",
+                f"流通市值: {format_mcap(info['fdv'])}\n"
+                f"流动性: {format_mcap(info['liquidity'])}",
                 chat_id
             )
         else:
@@ -232,7 +248,6 @@ def handle_command(text: str, chat_id: str):
         
         msg = "<b>📋 当前监控列表</b>\n\n"
         for i, (addr, info) in enumerate(watch_list.items(), 1):
-            # 实时获取最新价格和流通市值
             live = fetch_token_info(addr)
             if live:
                 price = live["price"]
@@ -241,7 +256,7 @@ def handle_command(text: str, chat_id: str):
                 msg += (
                     f"{i}. <b>{info.get('name', 'Unknown')}</b>\n"
                     f"<code>{addr}</code>\n"
-                    f"价格: <b>{price_str}</b> | 流通市值: ${mcap:,.0f}\n"
+                    f"价格: <b>{price_str}</b> | 流通市值: {format_mcap(mcap)}\n"
                     f"添加时间: {info.get('added_at', '-')}\n\n"
                 )
             else:
@@ -254,7 +269,6 @@ def handle_command(text: str, chat_id: str):
         
         if len(msg) > 4000:
             msg = msg[:3900] + "\n\n...（列表过长，已截断）"
-        
         send_telegram(msg, chat_id)
 
     elif text.startswith("/price"):
@@ -270,10 +284,10 @@ def handle_command(text: str, chat_id: str):
             send_telegram(
                 f"<b>{info['name']}</b>\n\n"
                 f"价格: <b>${info['price']:.8f}</b>\n"
-                f"市值(FDV): <b>${info['fdv']:,.0f}</b>\n"
-                f"流动性: ${info['liquidity']:,.0f}\n"
+                f"流通市值: <b>{format_mcap(info['fdv'])}</b>\n"
+                f"流动性: {format_mcap(info['liquidity'])}\n"
                 f"24h涨跌: {change_str}\n"
-                f"24h成交: ${info.get('volume_24h', 0):,.0f}\n\n"
+                f"24h成交: {format_mcap(info.get('volume_24h', 0))}\n\n"
                 f"<a href='{info['url']}'>DexScreener 查看</a>",
                 chat_id
             )
@@ -283,6 +297,70 @@ def handle_command(text: str, chat_id: str):
     elif text.startswith("/clear"):
         save_json(WATCH_FILE, {})
         send_telegram("✅ 已清空所有个人监控", chat_id)
+
+    elif text.startswith("/alert"):
+        parts = text.split()
+        if len(parts) < 3:
+            send_telegram("请使用格式：\n<code>/alert 合约地址 目标市值K</code>\n例如：/alert xxxxx 1000  （表示1000K=100万）", chat_id)
+            return
+        addr = parts[1].strip()
+        try:
+            target_k = float(parts[2])
+        except:
+            send_telegram("目标市值请输入数字（单位是K）", chat_id)
+            return
+        
+        info = fetch_token_info(addr)
+        if not info:
+            send_telegram("❌ 未找到该代币，请检查合约地址", chat_id)
+            return
+        
+        alerts = load_json(ALERT_FILE)
+        alerts[addr] = {
+            "name": info["name"],
+            "target_k": target_k,
+            "target_usd": target_k * 1000,
+            "added_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+        }
+        save_json(ALERT_FILE, alerts)
+        
+        send_telegram(
+            f"✅ 已设置市值提醒\n\n"
+            f"<b>{info['name']}</b>\n"
+            f"当前流通市值: {format_mcap(info['fdv'])}\n"
+            f"目标市值: <b>{target_k}K</b>（{format_mcap(target_k*1000)}）\n"
+            f"达到后将提醒你一次",
+            chat_id
+        )
+
+    elif text.startswith("/alerts"):
+        alerts = load_json(ALERT_FILE)
+        if not alerts:
+            send_telegram("当前没有设置任何市值提醒", chat_id)
+            return
+        msg = "<b>🔔 当前市值提醒</b>\n\n"
+        for i, (addr, info) in enumerate(alerts.items(), 1):
+            msg += (
+                f"{i}. <b>{info.get('name', 'Unknown')}</b>\n"
+                f"目标: <b>{info.get('target_k')}K</b>\n"
+                f"<code>{addr}</code>\n\n"
+            )
+        send_telegram(msg, chat_id)
+
+    elif text.startswith("/unalert"):
+        parts = text.split()
+        if len(parts) < 2:
+            send_telegram("请使用格式：\n<code>/unalert 合约地址</code>", chat_id)
+            return
+        addr = parts[1].strip()
+        alerts = load_json(ALERT_FILE)
+        if addr in alerts:
+            name = alerts[addr].get("name", addr)
+            del alerts[addr]
+            save_json(ALERT_FILE, alerts)
+            send_telegram(f"✅ 已取消提醒：{name}", chat_id)
+        else:
+            send_telegram("该地址没有设置提醒", chat_id)
 
     else:
         send_telegram("未知命令，请输入 /help 查看支持的命令", chat_id)
@@ -295,10 +373,39 @@ def process_telegram_commands():
         message = update.get("message", {})
         chat_id = str(message.get("chat", {}).get("id", ""))
         text = message.get("text", "")
-        if chat_id == TELEGRAM_CHAT_ID and text.startswith("/"):
+        if str(chat_id) == str(TELEGRAM_CHAT_ID) and text.startswith("/"):
             handle_command(text, chat_id)
 
-# ------------------- 扫描逻辑（新池发现仍用 Gecko，精度更高） -------------------
+def check_alerts():
+    """检查个人市值提醒是否达标"""
+    alerts = load_json(ALERT_FILE)
+    if not alerts:
+        return
+    
+    to_remove = []
+    for addr, info in list(alerts.items()):
+        live = fetch_token_info(addr)
+        if not live:
+            continue
+        current_mcap = live["fdv"]
+        target = info.get("target_usd", 0)
+        
+        if current_mcap >= target:
+            send_telegram(
+                f"🔔 <b>市值提醒触发</b>\n\n"
+                f"<b>{info.get('name', 'Unknown')}</b>\n"
+                f"当前流通市值: <b>{format_mcap(current_mcap)}</b>\n"
+                f"已达到你设置的目标 {info.get('target_k')}K\n\n"
+                f"<code>{addr}</code>"
+            )
+            to_remove.append(addr)
+    
+    for addr in to_remove:
+        alerts.pop(addr, None)
+    if to_remove:
+        save_json(ALERT_FILE, alerts)
+
+# ------------------- 扫描逻辑 -------------------
 def fetch_new_pools(pages=2):
     all_pools = []
     for page in range(1, pages + 1):
@@ -314,7 +421,6 @@ def fetch_new_pools(pages=2):
     return all_pools
 
 def parse_pool_gecko(pool):
-    """解析 GeckoTerminal 新池数据"""
     try:
         attr = pool.get("attributes", {})
         rel = pool.get("relationships", {})
@@ -355,7 +461,6 @@ def parse_pool_gecko(pool):
         return None
 
 def parse_pool_dex(pair):
-    """解析 DexScreener 池数据（用于复检）"""
     try:
         base = pair.get("baseToken", {})
         name = f"{base.get('name', 'Unknown')} ({base.get('symbol', '')})"
@@ -363,20 +468,18 @@ def parse_pool_dex(pair):
         token_address = base.get("address", "")
 
         liquidity = float(pair.get("liquidity", {}).get("usd") or 0)
-        fdv = float(pair.get("fdv") or 0)
+        fdv = float(pair.get("marketCap") or pair.get("fdv") or 0)
         
-        # DexScreener 的 m5 数据
         txns = pair.get("txns", {}).get("m5", {})
         buys = int(txns.get("buys") or 0)
         sells = int(txns.get("sells") or 0)
-        buyers = buys  # DexScreener 没有单独 buyers，用 buys 近似
+        buyers = buys
         
         vol_m5 = float(pair.get("volume", {}).get("m5") or 0)
 
         created = pair.get("pairCreatedAt")
         age = 999
         if created:
-            # pairCreatedAt 是毫秒时间戳
             ct = datetime.fromtimestamp(created / 1000, tz=timezone.utc)
             age = (datetime.now(timezone.utc) - ct).total_seconds() / 60
 
@@ -410,22 +513,22 @@ def score_pool(p):
     if liq >= 80000: score += 22
     elif liq >= 50000: score += 18
     elif liq >= 30000: score += 14
-    elif liq >= 25000: score += 10
+    elif liq >= 15000: score += 10
     br = p["buys_m5"] / max(p["sells_m5"], 1)
     if br >= 2.0: score += 18
     elif br >= 1.5: score += 14
-    elif br >= 1.25: score += 10
+    elif br >= 1.15: score += 10
     if p["buyers_m5"] >= 40: score += 12
     elif p["buyers_m5"] >= 25: score += 9
-    elif p["buyers_m5"] >= 15: score += 6
+    elif p["buyers_m5"] >= 10: score += 6
     if p["vol_m5"] >= 30000: score += 12
     elif p["vol_m5"] >= 15000: score += 9
-    elif p["vol_m5"] >= 8000: score += 6
+    elif p["vol_m5"] >= 5000: score += 6
     if p["fdv"] > 0 and p["liquidity"] > 0:
         r = p["fdv"] / p["liquidity"]
         if r <= 8: score += 12
-        elif r <= 12: score += 8
-        elif r <= 18: score += 4
+        elif r <= 15: score += 8
+        elif r <= 25: score += 4
     return min(score, 90)
 
 def is_still_healthy(old, new):
@@ -440,12 +543,12 @@ def format_primary(p, score):
     return (
         f"<b>🚀 初级提醒 | {score}/90</b>\n\n"
         f"<b>{p['name']}</b>\n"
-        f"流动性: <b>${p['liquidity']:,.0f}</b>\n"
-        f"FDV: ${p['fdv']:,.0f}\n"
+        f"流动性: <b>{format_mcap(p['liquidity'])}</b>\n"
+        f"市值: {format_mcap(p['fdv'])}\n"
         f"年龄: {p['age_minutes']:.1f}分钟\n"
         f"买/卖: {p['buys_m5']}/{p['sells_m5']} | 买家{p['buyers_m5']}\n"
         f"买/卖比: <b>{br:.2f}</b>\n"
-        f"5m成交: ${p['vol_m5']:,.0f}\n\n"
+        f"5m成交: {format_mcap(p['vol_m5'])}\n\n"
         f"<a href='{p['url']}'>DexScreener</a>\n"
         f"<code>{p['pool_address']}</code>"
     )
@@ -455,17 +558,23 @@ def format_recheck(p, hours, old_liq):
     return (
         f"<b>✅ 二次确认 | {hours}h复检通过</b>\n\n"
         f"<b>{p['name']}</b>\n"
-        f"流动性: <b>${p['liquidity']:,.0f}</b> ({chg:+.1f}%)\n"
-        f"FDV: ${p['fdv']:,.0f}\n"
+        f"流动性: <b>{format_mcap(p['liquidity'])}</b> ({chg:+.1f}%)\n"
+        f"市值: {format_mcap(p['fdv'])}\n"
         f"<a href='{p['url']}'>查看</a>"
     )
 
 def command_loop():
-    """单独线程处理 Telegram 命令，提高响应速度"""
+    last_alert_check = 0
     while True:
         try:
             process_telegram_commands()
-            time.sleep(2)  # 每 2 秒检查一次新消息
+            
+            now = time.time()
+            if now - last_alert_check >= ALERT_CHECK_INTERVAL:
+                check_alerts()
+                last_alert_check = now
+                
+            time.sleep(2)
         except Exception as e:
             print(f"命令处理异常: {e}")
             time.sleep(5)
@@ -475,10 +584,8 @@ def main_loop():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("警告：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未设置！")
     
-    send_telegram("🤖 机器人已启动（混合数据源）\n发送 /help 查看可用命令")
+    send_telegram("🤖 机器人已启动（过滤条件已放宽）\n发送 /help 查看可用命令")
 
-    # 启动命令处理线程
-    import threading
     t = threading.Thread(target=command_loop, daemon=True)
     t.start()
 
@@ -487,7 +594,6 @@ def main_loop():
 
     while True:
         try:
-            # 扫描新池
             pools = fetch_new_pools(pages=2)
             print(f"[{datetime.now().strftime('%H:%M:%S')}] 扫描到 {len(pools)} 个新池")
 
@@ -509,7 +615,6 @@ def main_loop():
             save_json(SEEN_FILE, list(seen))
             save_json(OBSERVE_FILE, observe)
 
-            # 复检
             now = datetime.now(timezone.utc)
             for addr, info in list(observe.items()):
                 first = datetime.fromisoformat(info["first_seen"])
