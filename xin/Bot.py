@@ -603,14 +603,35 @@ def main_loop():
                 if not hard_filter(p): continue
                 score = score_pool(p)
                 if score >= MIN_SCORE_TO_PUSH:
-                    send_telegram(format_primary(p, score))
-                    observe[p["pool_address"]] = {
-                        "first_seen": datetime.now(timezone.utc).isoformat(),
-                        "name": p["name"],
-                        "liquidity": p["liquidity"],
-                        "rechecks_done": []
-                    }
-                    seen.add(p["pool_address"])
+    # 二次确认：用 DexScreener 检查真实流动性
+    real_liq = 0
+    real_name = p["name"]
+    
+    if p.get("token_address"):
+        live_info = fetch_token_info(p["token_address"])
+        if live_info:
+            real_liq = live_info.get("liquidity", 0)
+            real_name = live_info.get("name", p["name"])
+    
+    # 真实流动性不达标，直接跳过
+    if real_liq < MIN_LIQUIDITY_USD:
+        print(f"跳过 {p['name']}，真实流动性只有 ${real_liq:.0f}")
+        seen.add(p["pool_address"])
+        continue
+    
+    # 用真实数据更新一下
+    p["liquidity"] = real_liq
+    p["name"] = real_name
+    
+    # 流动性合格才推送
+    send_telegram(format_primary(p, score))
+    observe[p["pool_address"]] = {
+        "first_seen": datetime.now(timezone.utc).isoformat(),
+        "name": p["name"],
+        "liquidity": real_liq,
+        "rechecks_done": []
+    }
+    seen.add(p["pool_address"])
 
             save_json(SEEN_FILE, list(seen))
             save_json(OBSERVE_FILE, observe)
