@@ -86,38 +86,56 @@ def get_updates():
 
 # ====================== DexScreener 精准数据 ======================
 def fetch_token_info(token_address: str):
-    """通过代币地址获取最精准的价格、市值、流动性（DexScreener）"""
-    url = f"{DEX_BASE}/latest/dex/tokens/{token_address}"
-    try:
-        r = session.get(url, headers=DEX_HEADERS, timeout=12)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        pairs = data.get("pairs") or []
-        if not pairs:
-            return None
+    """通过代币地址获取最精准的价格、市值、流动性（DexScreener，带备用方案）"""
+    token_address = token_address.strip()
+    
+    # 方案1：优先用 tokens 接口
+    urls = [
+        f"{DEX_BASE}/latest/dex/tokens/{token_address}",
+        f"{DEX_BASE}/token-pairs/v1/solana/{token_address}",
+        f"{DEX_BASE}/tokens/v1/solana/{token_address}"
+    ]
+    
+    for url in urls:
+        try:
+            r = session.get(url, headers=DEX_HEADERS, timeout=12)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            
+            # 兼容不同接口返回结构
+            pairs = data.get("pairs") or data.get("pair") or []
+            if isinstance(pairs, dict):
+                pairs = [pairs]
+            if not pairs:
+                continue
 
-        # 只保留 Solana 且流动性最高的池
-        sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
-        if not sol_pairs:
-            sol_pairs = pairs  # 兜底
+            # 只保留 Solana 且流动性最高的池
+            sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+            if not sol_pairs:
+                sol_pairs = pairs
 
-        best = max(sol_pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0) or 0))
-        
-        base = best.get("baseToken", {})
-        return {
-            "name": f"{base.get('name', 'Unknown')} ({base.get('symbol', '')})",
-            "symbol": base.get("symbol", ""),
-            "price": float(best.get("priceUsd") or 0),
-            "fdv": float(best.get("fdv") or 0),
-            "liquidity": float(best.get("liquidity", {}).get("usd") or 0),
-            "pool_address": best.get("pairAddress", ""),
-            "url": best.get("url") or f"https://dexscreener.com/solana/{best.get('pairAddress', '')}",
-            "volume_24h": float(best.get("volume", {}).get("h24") or 0),
-            "price_change_24h": float(best.get("priceChange", {}).get("h24") or 0)
-        }
-    except Exception as e:
-        print(f"DexScreener 获取代币信息失败: {e}")
+            best = max(sol_pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0) or 0))
+            
+            base = best.get("baseToken", {})
+            name = base.get("name") or "Unknown"
+            symbol = base.get("symbol") or ""
+            
+            return {
+                "name": f"{name} ({symbol})",
+                "symbol": symbol,
+                "price": float(best.get("priceUsd") or 0),
+                "fdv": float(best.get("fdv") or best.get("marketCap") or 0),
+                "liquidity": float(best.get("liquidity", {}).get("usd") or 0),
+                "pool_address": best.get("pairAddress", ""),
+                "url": best.get("url") or f"https://dexscreener.com/solana/{best.get('pairAddress', '')}",
+                "volume_24h": float(best.get("volume", {}).get("h24") or 0),
+                "price_change_24h": float(best.get("priceChange", {}).get("h24") or 0)
+            }
+        except Exception as e:
+            print(f"查询失败 {url}: {e}")
+            continue
+    
     return None
 
 def fetch_pool_by_address(pool_address: str):
