@@ -1,747 +1,665 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-市值提醒机器人 - 长期价值投资版（CoinPaprika）
-支持：价格或市值添加、自动换算、提醒显示价格、详细列表
-"""
-
-import re
 import time
-import sqlite3
-import logging
-import asyncio
-from datetime import datetime, timedelta
-from typing import Optional, Tuple
-
 import requests
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-    ConversationHandler,
-)
+import json
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
-# ==================== 配置区域 ====================
-BOT_TOKEN = "8648405680:AAEVSH8reK5x1tXuyl_e4nfeA8-9Nz2gcPA"          # ← 必填
-ADMIN_IDS = []                            # 留空则所有人可用
+# ====================== 配置区 ======================
+TELEGRAM_BOT_TOKEN = "8648405680:AAEVSH8reK5x1tXuyl_e4nfeA8-9Nz2gcPA"          # ← 在这里填入你的 Bot Token
+TELEGRAM_CHAT_ID   = "1085273843"          # ← 在这里填入你的 Chat ID
 
-CHECK_INTERVAL_HOURS = 1
-NOTIFY_TIMES = 3
-NOTIFY_INTERVAL_SECONDS = 90
-COOLDOWN_DAYS = 7
+SCAN_INTERVAL = 90               # 主循环间隔（秒）
 
-PAPRIKA_BASE = "https://api.coinpaprika.com/v1"
-# ==================================================
+BREAKOUT_WATCH_FILE = "breakout_watch.json"
+HISTORY_FILE = "price_history.json"
+ALERT_COOLDOWN_FILE = "alert_cooldown.json"
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# ====================== 成功率优先参数 ======================
+MIN_AGE_DAYS = 5
+MAX_AGE_DAYS = 1000                  # 最大存活天数改为1000天
+HISTORY_KEEP_DAYS = 14
 
-WAITING_TARGET = 1
-CONFIRM_REMOVEALL = 2
+CONSOL_HOURS = 18
+CONSOL_MAX_RANGE_PCT = 16
+VOL_SPIKE_MULT = 2.8
+MIN_VOL_H1 = 12000
+PRICE_BREAK_PCT = 15
 
+MIN_LIQ_BREAKOUT = 38000
+MAX_FDV_LIQ_RATIO = 14
+MIN_BUY_RATIO_M5 = 1.5
 
-# ==================== 数据库 ====================
-def init_db():
-    conn = sqlite3.connect("mcap_watch.db")
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS watches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            symbol TEXT NOT NULL,
-            cg_id TEXT NOT NULL,
-            name TEXT,
-            target_mcap REAL NOT NULL,
-            added_at TEXT,
-            cooldown_until TEXT,
-            last_notified TEXT
-        )
-    """)
-    c.execute("CREATE INDEX IF NOT EXISTS idx_user ON watches(user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_cg ON watches(cg_id)")
-    conn.commit()
-    conn.close()
+MIN_SCORE_BREAKOUT = 72
+ALERT_COOLDOWN_HOURS = 4
+# ====================================================
 
+DEX_BASE = "https://api.dexscreener.com"
+DEX_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0"
+}
 
-def db_execute(query, params=(), fetch=False):
-    conn = sqlite3.connect("mcap_watch.db")
-    c = conn.cursor()
-    c.execute(query, params)
-    if fetch:
-        result = c.fetchall()
-    else:
-        conn.commit()
-        result = c.rowcount
-    conn.close()
-    return result
+session = requests.Session()
+session.headers.update(DEX_HEADERS)
 
+last_update_id = 0
 
-# ==================== 工具函数 ====================
-def parse_number(text: str) -> Optional[float]:
-    """解析纯数字（支持 $ 和逗号）→ 当作价格"""
-    text = text.strip().upper().replace(",", "").replace("$", "").replace(" ", "")
-    if not text:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-def parse_mcap(text: str) -> Optional[float]:
-    """解析带单位的市值（K/M/B/T）"""
-    text = text.strip().upper().replace(",", "").replace(" ", "")
-    if not text:
-        return None
-    match = re.match(r"^([\d.]+)([KMBT])$", text)
-    if not match:
-        return None
-    num = float(match.group(1))
-    unit = match.group(2)
-    multipliers = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000, "T": 1_000_000_000_000}
-    return num * multipliers.get(unit, 1)
-
-
-def format_mcap(value: float) -> str:
-    if value is None:
-        return "N/A"
-    if value >= 1_000_000_000_000:
-        return f"{value / 1_000_000_000_000:.2f}T"
-    if value >= 1_000_000_000:
-        return f"{value / 1_000_000_000:.2f}B"
-    if value >= 1_000_000:
-        return f"{value / 1_000_000:.2f}M"
-    if value >= 1_000:
-        return f"{value / 1_000:.2f}K"
-    return f"{value:,.0f}"
-
-
-def is_allowed(user_id: int) -> bool:
-    if not ADMIN_IDS:
-        return True
-    return user_id in ADMIN_IDS
-
-
-def paprika_request(endpoint: str, params: dict = None):
-    url = f"{PAPRIKA_BASE}{endpoint}"
-    for attempt in range(3):
+def load_json(path):
+    if Path(path).exists():
         try:
-            r = requests.get(url, params=params, timeout=15)
-            if r.status_code == 429:
-                wait = 20 * (attempt + 1)
-                logger.warning(f"CoinPaprika 限流，等待 {wait} 秒...")
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            return r.json()
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception as e:
-            logger.error(f"Paprika request failed (attempt {attempt+1}): {e}")
-            time.sleep(2)
-    return None
+            print(f"读取 {path} 失败: {e}")
+            return {}
+    return {}
 
-
-def resolve_coin(query: str) -> Optional[Tuple[str, str, str]]:
-    query = query.strip()
-    if not query:
-        return None
-
-    q_lower = query.lower()
-    data = paprika_request("/search", {"q": query})
-    if not data or "currencies" not in data or not data["currencies"]:
-        return None
-
-    currencies = data["currencies"]
-    exact_matches = [c for c in currencies if c.get("symbol", "").lower() == q_lower]
-    if exact_matches:
-        exact_matches.sort(key=lambda x: x.get("rank") or 99999)
-        c = exact_matches[0]
-        return c["id"], c["symbol"].upper(), c["name"]
-
-    c = currencies[0]
-    return c["id"], c.get("symbol", "").upper(), c.get("name", "")
-
-
-def get_ticker_info(paprika_id: str) -> Optional[dict]:
-    data = paprika_request(f"/tickers/{paprika_id}")
-    if not data:
-        return None
+def save_json(path, data):
     try:
-        quotes = data["quotes"]["USD"]
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"保存 {path} 失败: {e}")
+
+def send_telegram(text, chat_id=None):
+    target = chat_id or TELEGRAM_CHAT_ID
+    if not target or not TELEGRAM_BOT_TOKEN:
+        print("发送失败：TOKEN 或 CHAT_ID 为空")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": target,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False
+    }
+    try:
+        r = session.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            print(f"Telegram发送失败 status={r.status_code}: {r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"Telegram发送异常: {e}")
+        return False
+
+def get_updates():
+    global last_update_id
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"offset": last_update_id + 1, "timeout": 10}
+    try:
+        r = session.get(url, params=params, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("result", [])
+        else:
+            print(f"getUpdates 失败 status={r.status_code}")
+    except Exception as e:
+        print(f"getUpdates 异常: {e}")
+    return []
+
+# ====================== DexScreener ======================
+def fetch_token_info(token_address: str):
+    url = f"{DEX_BASE}/latest/dex/tokens/{token_address}"
+    try:
+        r = session.get(url, headers=DEX_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        pairs = data.get("pairs") or []
+        if not pairs:
+            return None
+
+        sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+        if not sol_pairs:
+            sol_pairs = pairs
+
+        best = max(sol_pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0) or 0))
+        base = best.get("baseToken", {})
+        created = best.get("pairCreatedAt")
+
+        age_days = 999
+        if created:
+            ct = datetime.fromtimestamp(created / 1000, tz=timezone.utc)
+            age_days = (datetime.now(timezone.utc) - ct).total_seconds() / 86400
+
         return {
-            "price": float(quotes["price"]),
-            "market_cap": float(quotes["market_cap"]),
-            "circulating_supply": float(data.get("circulating_supply") or 0)
+            "name": f"{base.get('name', 'Unknown')} ({base.get('symbol', '')})",
+            "symbol": base.get("symbol", ""),
+            "price": float(best.get("priceUsd") or 0),
+            "fdv": float(best.get("fdv") or 0),
+            "liquidity": float(best.get("liquidity", {}).get("usd") or 0),
+            "pool_address": best.get("pairAddress", ""),
+            "url": best.get("url") or f"https://dexscreener.com/solana/{best.get('pairAddress', '')}",
+            "volume_24h": float(best.get("volume", {}).get("h24") or 0),
+            "price_change_24h": float(best.get("priceChange", {}).get("h24") or 0),
+            "pairCreatedAt": created,
+            "age_days": age_days
         }
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-def get_market_cap(paprika_id: str) -> Optional[float]:
-    info = get_ticker_info(paprika_id)
-    if info:
-        return info["market_cap"]
+    except Exception as e:
+        print(f"fetch_token_info 失败: {e}")
     return None
 
+def enrich_with_pair(token_address: str):
+    url = f"{DEX_BASE}/latest/dex/tokens/{token_address}"
+    try:
+        r = session.get(url, headers=DEX_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return None
+        pairs = r.json().get("pairs") or []
+        sol = [p for p in pairs if p.get("chainId") == "solana"]
+        if not sol:
+            return None
+        best = max(sol, key=lambda x: float(x.get("liquidity", {}).get("usd", 0) or 0))
+        return best
+    except Exception as e:
+        print(f"enrich_with_pair 失败: {e}")
+        return None
 
-# ==================== 命令 ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
-        await update.message.reply_text("无权限使用此机器人。")
-        return
-    await update.message.reply_text(
-        "欢迎使用【市值提醒机器人】（CoinPaprika 版）\n\n"
-        "📌 支持两种添加方式：\n"
-        "• 市值：`BTC 1.58T`  `SOL 55B`\n"
-        "• 价格：`BTC 78000`  `BTC $78000`\n\n"
-        "输入 /help 查看完整命令",
-        parse_mode="Markdown"
-    )
+def parse_pair(pair: dict):
+    try:
+        base = pair.get("baseToken", {})
+        name = f"{base.get('name', 'Unknown')} ({base.get('symbol', '')})"
+        token_address = base.get("address", "")
+        pool_address = pair.get("pairAddress", "")
 
+        liquidity = float(pair.get("liquidity", {}).get("usd") or 0)
+        fdv = float(pair.get("fdv") or 0)
+        price = float(pair.get("priceUsd") or 0)
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = """
-*命令列表*
+        txns = pair.get("txns", {}) or {}
+        m5 = txns.get("m5", {}) or {}
+        buys = int(m5.get("buys") or 0)
+        sells = int(m5.get("sells") or 0)
 
-*添加监控*
-• 按市值：`BTC 1.58T`  `SOL 55B`
-• 按价格：`BTC 78000`  `BTC $78000`（自动换算市值）
+        vol = pair.get("volume", {}) or {}
+        vol_m5 = float(vol.get("m5") or 0)
+        vol_h1 = float(vol.get("h1") or 0)
+        vol_h6 = float(vol.get("h6") or 0)
+        vol_h24 = float(vol.get("h24") or 0)
 
-*管理*
-/list - 查看监控列表（含当前价格、市值、提醒价格）
-/edit 符号 新目标 - 修改目标市值
-/remove 符号1 符号2 ... - 批量删除
-/removeall - 清空所有监控（需确认）
+        pc = pair.get("priceChange", {}) or {}
+        pc_h1 = float(pc.get("h1") or 0)
+        pc_h6 = float(pc.get("h6") or 0)
+        pc_h24 = float(pc.get("h24") or 0)
 
-*查询*
-/mcap 符号 - 查看单个币当前真实市值
-/mcap - 查看你所有监控币的当前市值
-/status - 机器人状态
+        created = pair.get("pairCreatedAt")
+        age_days = 999
+        if created:
+            ct = datetime.fromtimestamp(created / 1000, tz=timezone.utc)
+            age_days = (datetime.now(timezone.utc) - ct).total_seconds() / 86400
 
-*其他*
-/help - 显示本帮助
-/cancel - 取消当前操作
-"""
-    await update.message.reply_text(text, parse_mode="Markdown")
+        return {
+            "name": name,
+            "token_address": token_address,
+            "pool_address": pool_address,
+            "price": price,
+            "liquidity": liquidity,
+            "fdv": fdv,
+            "vol_m5": vol_m5,
+            "vol_h1": vol_h1,
+            "vol_h6": vol_h6,
+            "vol_h24": vol_h24,
+            "buys_m5": buys,
+            "sells_m5": sells,
+            "price_change_h1": pc_h1,
+            "price_change_h6": pc_h6,
+            "price_change_h24": pc_h24,
+            "age_days": age_days,
+            "url": pair.get("url") or f"https://dexscreener.com/solana/{pool_address}",
+            "pairCreatedAt": created
+        }
+    except Exception as e:
+        print(f"parse_pair 失败: {e}")
+        return None
 
+# ====================== 历史快照 ======================
+def update_price_history(breakout_watch: dict):
+    history = load_json(HISTORY_FILE)
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=HISTORY_KEEP_DAYS)).isoformat()
 
-async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    rows = db_execute(
-        "SELECT symbol, cg_id, name, target_mcap, cooldown_until FROM watches WHERE user_id=? ORDER BY symbol",
-        (user_id,), fetch=True
-    )
-    if not rows:
-        await update.message.reply_text("当前没有监控任何代币。\n发送 `符号 目标市值` 或 `符号 价格` 即可添加。")
-        return
-
-    await update.message.reply_text(f"正在查询 {len(rows)} 个代币的实时数据，请稍候...")
-
-    now = datetime.utcnow()
-    lines = [f"*当前监控列表*（共 {len(rows)} 个）\n"]
-
-    for symbol, paprika_id, name, target, cooldown in rows:
-        info = get_ticker_info(paprika_id)
-        time.sleep(1.5)
-
-        cooldown_text = ""
-        if cooldown:
-            try:
-                cd = datetime.fromisoformat(cooldown)
-                if cd > now:
-                    cooldown_text = f"\n  ❄️冷却至 {cd.strftime('%m-%d')}"
-            except:
-                pass
-
-        if info is None:
-            lines.append(
-                f"• *{symbol}* ({name or '-'})\n"
-                f"  当前数据获取失败\n"
-                f"  提醒市值：≤ {format_mcap(target)}{cooldown_text}"
-            )
+    for addr in list(breakout_watch.keys()):
+        raw = enrich_with_pair(addr)
+        if not raw:
+            continue
+        p = parse_pair(raw)
+        if not p:
             continue
 
-        current_price = info["price"]
-        current_mcap = info["market_cap"]
-        circ_supply = info["circulating_supply"]
+        if addr not in history:
+            history[addr] = []
 
-        if circ_supply > 0:
-            target_price = target / circ_supply
-            target_price_str = f"${target_price:.4f}" if target_price < 1 else f"${target_price:.2f}"
-        else:
-            target_price_str = "无法估算"
+        entry = {
+            "ts": now.isoformat(),
+            "price": p["price"],
+            "liq": p["liquidity"],
+            "vol_m5": p["vol_m5"],
+            "vol_h1": p["vol_h1"],
+            "vol_h6": p["vol_h6"],
+            "buys_m5": p["buys_m5"],
+            "sells_m5": p["sells_m5"],
+            "fdv": p["fdv"]
+        }
+        history[addr].append(entry)
+        history[addr] = [h for h in history[addr] if h["ts"] > cutoff]
 
-        if current_price < 0.01:
-            price_str = f"${current_price:.6f}"
-        elif current_price < 1:
-            price_str = f"${current_price:.4f}"
-        else:
-            price_str = f"${current_price:.2f}"
+    save_json(HISTORY_FILE, history)
+    return history
 
-        status_icon = "🟢" if current_mcap <= target else "⚪"
+# ====================== 四套策略 ======================
+def strategy_A_volume_price_break(hist: list, current: dict) -> dict:
+    if len(hist) < 10:
+        return {"score": 0, "reason": "历史不足"}
 
-        lines.append(
-            f"• *{symbol}* ({name or '-'})\n"
-            f"  当前价格：{price_str}\n"
-            f"  当前市值：{format_mcap(current_mcap)} {status_icon}\n"
-            f"  提醒市值：≤ {format_mcap(target)}\n"
-            f"  提醒价格：约 {target_price_str}{cooldown_text}"
+    prices = [h["price"] for h in hist if h.get("price", 0) > 0]
+    vols = [h.get("vol_h1", 0) or h.get("vol_m5", 0) * 12 for h in hist]
+
+    if len(prices) < 8 or not vols:
+        return {"score": 0, "reason": "数据不足"}
+
+    recent_high = max(prices[-15:]) if len(prices) >= 15 else max(prices)
+    avg_vol = sum(vols[:-3]) / max(len(vols) - 3, 1)
+    curr_vol = vols[-1]
+    curr_price = current.get("price", prices[-1])
+
+    vol_mult = curr_vol / avg_vol if avg_vol > 0 else 0
+    price_break = (curr_price - recent_high) / recent_high * 100 if recent_high > 0 else 0
+
+    score = 0
+    reasons = []
+
+    if vol_mult >= VOL_SPIKE_MULT:
+        score += 36
+        reasons.append(f"量放大{vol_mult:.1f}x")
+    elif vol_mult >= 2.0:
+        score += 16
+        reasons.append(f"量增{vol_mult:.1f}x")
+
+    if price_break >= PRICE_BREAK_PCT:
+        score += 42
+        reasons.append(f"突破高点+{price_break:.1f}%")
+    elif price_break > 8:
+        score += 18
+        reasons.append(f"接近突破+{price_break:.1f}%")
+
+    if current.get("liquidity", 0) >= MIN_LIQ_BREAKOUT:
+        score += 12
+
+    return {
+        "score": min(score, 100),
+        "reason": " | ".join(reasons) or "无强信号",
+        "vol_mult": round(vol_mult, 2),
+        "price_break": round(price_break, 1)
+    }
+
+def strategy_B_consolidation_then_spike(hist: list, current: dict) -> dict:
+    if len(hist) < 12:
+        return {"score": 0, "reason": "历史不足"}
+
+    now = datetime.now(timezone.utc)
+    consol_cutoff = (now - timedelta(hours=CONSOL_HOURS)).isoformat()
+    consol = [h for h in hist if h["ts"] >= consol_cutoff]
+
+    if len(consol) < 8:
+        return {"score": 0, "reason": "横盘窗口数据少"}
+
+    prices = [h["price"] for h in consol if h.get("price", 0) > 0]
+    if len(prices) < 6:
+        return {"score": 0, "reason": "价格数据不足"}
+
+    high, low = max(prices), min(prices)
+    range_pct = (high - low) / low * 100 if low > 0 else 999
+
+    vols = [h.get("vol_h1", 0) or h.get("vol_m5", 0) * 12 for h in consol]
+    avg_vol = sum(vols[:-2]) / max(len(vols) - 2, 1) if len(vols) > 2 else 0
+    curr_vol = sum(vols[-2:]) / 2 if len(vols) >= 2 else (vols[-1] if vols else 0)
+    vol_mult = curr_vol / avg_vol if avg_vol > 0 else 0
+
+    score = 0
+    reasons = []
+
+    if range_pct <= CONSOL_MAX_RANGE_PCT:
+        score += 35
+        reasons.append(f"横盘{range_pct:.1f}%")
+    else:
+        return {"score": 0, "reason": f"波动过大({range_pct:.1f}%)"}
+
+    if vol_mult >= VOL_SPIKE_MULT:
+        score += 45
+        reasons.append(f"量突增{vol_mult:.1f}x")
+    elif vol_mult >= 2.0:
+        score += 20
+        reasons.append(f"量增加{vol_mult:.1f}x")
+
+    last_price = prices[-1]
+    if last_price >= high * 0.97:
+        score += 12
+        reasons.append("接近/突破横盘高点")
+
+    if current.get("liquidity", 0) >= MIN_LIQ_BREAKOUT:
+        score += 8
+
+    return {
+        "score": min(score, 100),
+        "reason": " | ".join(reasons),
+        "range_pct": round(range_pct, 1),
+        "vol_mult": round(vol_mult, 2)
+    }
+
+def strategy_C_momentum_buys(current: dict) -> dict:
+    buys = current.get("buys_m5", 0)
+    sells = current.get("sells_m5", 0)
+    br = buys / max(sells, 1)
+    vol_m5 = current.get("vol_m5", 0)
+    pc_h1 = current.get("price_change_h1", 0) or 0
+
+    score = 0
+    reasons = []
+
+    if br >= 2.0 and buys >= 20:
+        score += 32
+        reasons.append(f"强买压{br:.1f}")
+    elif br >= MIN_BUY_RATIO_M5:
+        score += 18
+        reasons.append(f"买压{br:.1f}")
+
+    if vol_m5 >= 15000:
+        score += 18
+        reasons.append(f"5m量${vol_m5:,.0f}")
+    elif vol_m5 >= 8000:
+        score += 10
+
+    if pc_h1 >= 8:
+        score += 22
+        reasons.append(f"1h涨{pc_h1:.1f}%")
+    elif pc_h1 >= 4:
+        score += 10
+
+    if current.get("liquidity", 0) >= MIN_LIQ_BREAKOUT:
+        score += 8
+
+    return {
+        "score": min(score, 100),
+        "reason": " | ".join(reasons) or "无强信号"
+    }
+
+def strategy_D_combined(hist, current) -> dict:
+    a = strategy_A_volume_price_break(hist, current)
+    b = strategy_B_consolidation_then_spike(hist, current)
+    c = strategy_C_momentum_buys(current)
+
+    score = int(a["score"] * 0.25 + b["score"] * 0.50 + c["score"] * 0.25)
+
+    return {
+        "score": score,
+        "reason": f"A:{a['score']}  B:{b['score']}  C:{c['score']}",
+        "details": {"A": a, "B": b, "C": c}
+    }
+
+def hard_quality_filter(current: dict) -> bool:
+    if current.get("liquidity", 0) < MIN_LIQ_BREAKOUT:
+        return False
+    if current.get("age_days", 999) < MIN_AGE_DAYS or current.get("age_days", 0) > MAX_AGE_DAYS:
+        return False
+    if current.get("fdv", 0) > 0 and current.get("liquidity", 0) > 0:
+        if current["fdv"] / current["liquidity"] > MAX_FDV_LIQ_RATIO:
+            return False
+    if current.get("vol_h1", 0) < MIN_VOL_H1 and current.get("vol_m5", 0) * 12 < MIN_VOL_H1:
+        return False
+    buys = current.get("buys_m5", 0)
+    sells = current.get("sells_m5", 0)
+    if buys / max(sells, 1) < MIN_BUY_RATIO_M5 and buys < 15:
+        return False
+    if current.get("price_change_h6", 0) > 50:
+        return False
+    return True
+
+# ====================== 命令处理 ======================
+def handle_command(text: str, chat_id: str):
+    text = text.strip()
+    breakout_watch = load_json(BREAKOUT_WATCH_FILE)
+
+    if text.startswith("/start") or text.startswith("/help"):
+        msg = (
+            "<b>🤖 横盘突破监控机器人（成功率优先）</b>\n\n"
+            "专注上线 5~1000 天代币\n"
+            "捕捉横盘后放量突破（突破高点≥15%）\n\n"
+            "<b>命令：</b>\n"
+            "/bwatch 合约地址 - 加入监控\n"
+            "/bunwatch 合约地址 - 删除监控\n"
+            "/blist - 查看监控列表\n"
+            "/bclear - 清空全部\n"
+            "/price 合约地址 - 查看数据\n"
+            "/status - 运行状态\n"
+            "/help"
         )
+        send_telegram(msg, chat_id)
 
-    for i in range(0, len(lines), 6):
-        chunk = "\n\n".join(lines[i:i+6])
-        await update.message.reply_text(chunk, parse_mode="Markdown")
-
-
-async def edit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if len(context.args) < 2:
-        await update.message.reply_text("用法：/edit 符号 新目标\n例：/edit BTC 1.5T  或  /edit BTC 75000")
-        return
-
-    symbol = context.args[0].upper()
-    value_str = context.args[1]
-
-    target_mcap = parse_mcap(value_str)
-    if target_mcap is None:
-        price = parse_number(value_str)
-        if price is None:
-            await update.message.reply_text("格式错误，请使用 1.5T 或 78000")
-            return
-        # 需要换算
-        rows = db_execute(
-            "SELECT cg_id FROM watches WHERE user_id=? AND symbol=?",
-            (user_id, symbol), fetch=True
+    elif text.startswith("/status"):
+        history = load_json(HISTORY_FILE)
+        cooldown = load_json(ALERT_COOLDOWN_FILE)
+        msg = (
+            f"<b>📊 运行状态</b>\n\n"
+            f"当前监控: {len(breakout_watch)}\n"
+            f"历史币种: {len(history)}\n"
+            f"冷却中: {len(cooldown)}\n"
+            f"年龄范围: {MIN_AGE_DAYS}~{MAX_AGE_DAYS}天\n"
+            f"最低流动性: ${MIN_LIQ_BREAKOUT:,}\n"
+            f"突破要求: ≥{PRICE_BREAK_PCT}%\n"
+            f"综合分阈值: {MIN_SCORE_BREAKOUT}\n"
+            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
-        if not rows:
-            await update.message.reply_text(f"你没有监控 {symbol}")
+        send_telegram(msg, chat_id)
+
+    elif text.startswith("/bwatch"):
+        parts = text.split()
+        if len(parts) < 2:
+            send_telegram("格式：\n<code>/bwatch 合约地址</code>", chat_id)
             return
-        info = get_ticker_info(rows[0][0])
-        if not info or info["circulating_supply"] <= 0:
-            await update.message.reply_text("无法获取流通量，请直接用市值修改")
-            return
-        target_mcap = price * info["circulating_supply"]
-
-    count = db_execute(
-        "UPDATE watches SET target_mcap=?, cooldown_until=NULL WHERE user_id=? AND symbol=?",
-        (target_mcap, user_id, symbol)
-    )
-    if count == 0:
-        await update.message.reply_text(f"你没有监控 {symbol}")
-        return
-
-    await update.message.reply_text(
-        f"✅ 已修改 *{symbol}* 目标市值 → ≤ *{format_mcap(target_mcap)}*",
-        parse_mode="Markdown"
-    )
-
-
-async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not context.args:
-        await update.message.reply_text("用法：/remove 符号1 符号2 ...\n例：/remove BTC ETH SOL")
-        return
-
-    removed = []
-    not_found = []
-    for sym in context.args:
-        symbol = sym.upper()
-        count = db_execute(
-            "DELETE FROM watches WHERE user_id=? AND symbol=?",
-            (user_id, symbol)
-        )
-        if count > 0:
-            removed.append(symbol)
-        else:
-            not_found.append(symbol)
-
-    msg = ""
-    if removed:
-        msg += f"✅ 已删除：{', '.join(removed)}"
-    if not_found:
-        msg += f"\n❌ 未找到：{', '.join(not_found)}"
-    await update.message.reply_text(msg or "没有删除任何内容")
-
-
-async def removeall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    count = db_execute(
-        "SELECT COUNT(*) FROM watches WHERE user_id=?", (user_id,), fetch=True
-    )[0][0]
-    if count == 0:
-        await update.message.reply_text("你当前没有监控任何代币。")
-        return
-
-    context.user_data["confirm_removeall"] = True
-    await update.message.reply_text(
-        f"⚠️ 你确定要删除自己全部 *{count}* 个监控吗？\n\n请回复 `确认删除` 来确认。",
-        parse_mode="Markdown"
-    )
-    return CONFIRM_REMOVEALL
-
-
-async def confirm_removeall(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text.strip() != "确认删除":
-        context.user_data.pop("confirm_removeall", None)
-        await update.message.reply_text("已取消清空操作。")
-        return ConversationHandler.END
-
-    user_id = update.effective_user.id
-    count = db_execute("DELETE FROM watches WHERE user_id=?", (user_id,))
-    context.user_data.pop("confirm_removeall", None)
-    await update.message.reply_text(f"✅ 已清空你的全部监控（共删除 {count} 个）。")
-    return ConversationHandler.END
-
-
-async def mcap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if context.args:
-        query = context.args[0]
-        coin = resolve_coin(query)
-        if not coin:
-            await update.message.reply_text(f"找不到 {query}")
-            return
-        paprika_id, symbol, name = coin
-        info = get_ticker_info(paprika_id)
+        addr = parts[1].strip()
+        info = fetch_token_info(addr)
         if not info:
-            await update.message.reply_text(f"获取 {symbol} 数据失败")
+            send_telegram("❌ 未找到该代币", chat_id)
             return
 
-        rows = db_execute(
-            "SELECT target_mcap FROM watches WHERE user_id=? AND cg_id=?",
-            (user_id, paprika_id), fetch=True
+        age = info.get("age_days", 999)
+        breakout_watch[addr] = {
+            "name": info["name"],
+            "added_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "pool_address": info.get("pool_address", ""),
+            "age_days_at_add": round(age, 1)
+        }
+        save_json(BREAKOUT_WATCH_FILE, breakout_watch)
+
+        tip = ""
+        if age < MIN_AGE_DAYS:
+            tip = f"\n⚠️ 当前年龄仅 {age:.1f} 天，未达最低要求。"
+        elif age > MAX_AGE_DAYS:
+            tip = f"\n⚠️ 当前年龄 {age:.1f} 天，已超过最大关注范围。"
+        elif info.get("liquidity", 0) < MIN_LIQ_BREAKOUT:
+            tip = f"\n⚠️ 流动性 ${info['liquidity']:,.0f} 低于推荐门槛。"
+
+        send_telegram(
+            f"✅ 已加入监控\n\n"
+            f"<b>{info['name']}</b>\n"
+            f"年龄: <b>{age:.1f} 天</b>\n"
+            f"流动性: ${info['liquidity']:,.0f}\n"
+            f"市值: ${info['fdv']:,.0f}\n"
+            f"价格: ${info['price']:.8f}{tip}",
+            chat_id
         )
-        extra = ""
-        if rows:
-            target = rows[0][0]
-            status = "✅ 已低于目标" if info["market_cap"] <= target else "尚未达到目标"
-            extra = f"\n你的目标：≤ {format_mcap(target)}\n状态：{status}"
 
-        p = info["price"]
-        price_str = f"${p:.6f}" if p < 0.01 else (f"${p:.4f}" if p < 1 else f"${p:.2f}")
-
-        await update.message.reply_text(
-            f"*{symbol}* ({name})\n"
-            f"当前价格：{price_str}\n"
-            f"当前市值：*{format_mcap(info['market_cap'])}*{extra}",
-            parse_mode="Markdown"
-        )
-        return
-
-    rows = db_execute(
-        "SELECT symbol, cg_id, name, target_mcap FROM watches WHERE user_id=? ORDER BY symbol",
-        (user_id,), fetch=True
-    )
-    if not rows:
-        await update.message.reply_text("你没有监控任何代币。")
-        return
-
-    await update.message.reply_text(f"正在查询 {len(rows)} 个代币，请稍候...")
-    lines = [f"*你的监控币当前市值*（共 {len(rows)} 个）\n"]
-    for symbol, paprika_id, name, target in rows:
-        info = get_ticker_info(paprika_id)
-        if not info:
-            status = "获取失败"
+    elif text.startswith("/bunwatch"):
+        parts = text.split()
+        if len(parts) < 2:
+            send_telegram("格式：\n<code>/bunwatch 合约地址</code>", chat_id)
+            return
+        addr = parts[1].strip()
+        if addr in breakout_watch:
+            name = breakout_watch[addr].get("name", addr)
+            del breakout_watch[addr]
+            save_json(BREAKOUT_WATCH_FILE, breakout_watch)
+            send_telegram(f"✅ 已删除：{name}", chat_id)
         else:
-            mark = "🟢" if info["market_cap"] <= target else "⚪"
-            status = f"{mark} {format_mcap(info['market_cap'])}  (目标 {format_mcap(target)})"
-        lines.append(f"• *{symbol}*  {status}")
-        time.sleep(1.5)
+            send_telegram("不在监控列表中", chat_id)
 
-    for i in range(0, len(lines), 25):
-        await update.message.reply_text("\n".join(lines[i:i+25]), parse_mode="Markdown")
+    elif text.startswith("/blist"):
+        if not breakout_watch:
+            send_telegram("当前没有监控任何代币", chat_id)
+            return
+        msg = "<b>📋 当前监控列表</b>\n\n"
+        for i, (addr, info) in enumerate(breakout_watch.items(), 1):
+            msg += f"{i}. <b>{info.get('name')}</b>\n<code>{addr}</code>\n添加: {info.get('added_at')}\n\n"
+        send_telegram(msg, chat_id)
 
+    elif text.startswith("/bclear"):
+        save_json(BREAKOUT_WATCH_FILE, {})
+        send_telegram("✅ 已清空所有监控", chat_id)
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    count = db_execute("SELECT COUNT(*) FROM watches WHERE user_id=?", (user_id,), fetch=True)[0][0]
-    total = db_execute("SELECT COUNT(*) FROM watches", fetch=True)[0][0]
-    await update.message.reply_text(
-        f"*机器人状态*\n\n"
-        f"• 你的监控数量：{count}\n"
-        f"• 全局监控数量：{total}\n"
-        f"• 数据源：CoinPaprika\n"
-        f"• 检查频率：每 {CHECK_INTERVAL_HOURS} 小时\n"
-        f"• 触发后通知次数：{NOTIFY_TIMES} 次\n"
-        f"• 冷却期：{COOLDOWN_DAYS} 天",
-        parse_mode="Markdown"
-    )
+    elif text.startswith("/price"):
+        parts = text.split()
+        if len(parts) < 2:
+            send_telegram("格式：\n<code>/price 合约地址</code>", chat_id)
+            return
+        addr = parts[1].strip()
+        info = fetch_token_info(addr)
+        if info:
+            change = info.get("price_change_24h", 0)
+            change_str = f"+{change:.1f}%" if change >= 0 else f"{change:.1f}%"
+            send_telegram(
+                f"<b>{info['name']}</b>\n\n"
+                f"价格: <b>${info['price']:.8f}</b>\n"
+                f"市值: <b>${info['fdv']:,.0f}</b>\n"
+                f"流动性: ${info['liquidity']:,.0f}\n"
+                f"24h涨跌: {change_str}\n"
+                f"年龄: <b>{info.get('age_days', 0):.1f} 天</b>\n\n"
+                f"<a href='{info['url']}'>DexScreener</a>",
+                chat_id
+            )
+        else:
+            send_telegram("❌ 获取失败", chat_id)
 
+    else:
+        send_telegram("未知命令，请输入 /help", chat_id)
 
-# ==================== 添加逻辑 ====================
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
-        return
-    if context.user_data.get("confirm_removeall"):
-        return
+def process_telegram_commands():
+    global last_update_id
+    updates = get_updates()
+    for update in updates:
+        last_update_id = update["update_id"]
+        message = update.get("message") or update.get("edited_message") or {}
+        chat = message.get("chat", {})
+        chat_id = str(chat.get("id", ""))
+        text = message.get("text") or ""
 
-    text = update.message.text.strip()
-    user_id = update.effective_user.id
-
-    lines = re.split(r"[\n,]+", text)
-    added = []
-    failed = []
-
-    for line in lines:
-        line = line.strip()
-        if not line:
+        if not text.startswith("/"):
             continue
 
-        parts = line.split()
-        if len(parts) == 1:
-            context.user_data["pending_symbol"] = parts[0]
-            await update.message.reply_text(
-                f"请输入 *{parts[0].upper()}* 的目标（市值如 1.5T 或价格如 78000）：",
-                parse_mode="Markdown"
-            )
-            return WAITING_TARGET
+        print(f"收到命令: {text}  from chat_id={chat_id}")
 
-        if len(parts) >= 2:
-            symbol_or_addr = parts[0]
-            value_str = parts[1]
+        try:
+            handle_command(text, chat_id)
+        except Exception as e:
+            print(f"处理命令异常: {e}")
+            send_telegram(f"处理命令时出错: {e}", chat_id)
 
-            target_mcap = parse_mcap(value_str)
-            is_price = False
-            price = None
+# ====================== 主循环 ======================
+def main_loop():
+    print("=" * 55)
+    print("横盘突破监控机器人启动（成功率优先 | 年龄5-1000天 | 突破≥15%）")
+    print(f"TOKEN 是否设置: {'是' if TELEGRAM_BOT_TOKEN else '否'}")
+    print(f"CHAT_ID 是否设置: {'是' if TELEGRAM_CHAT_ID else '否'}")
+    print("=" * 55)
 
-            if target_mcap is None:
-                price = parse_number(value_str)
-                if price is None:
-                    failed.append(f"{line}（格式错误，请用 1.5T 或 78000）")
-                    continue
-                is_price = True
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("警告：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未设置！")
 
-            coin = resolve_coin(symbol_or_addr)
-            if not coin:
-                failed.append(f"{symbol_or_addr}（找不到该币）")
+    send_telegram(
+        "🤖 机器人已启动（成功率优先版）\n"
+        f"年龄范围: {MIN_AGE_DAYS}~{MAX_AGE_DAYS}天\n"
+        f"最低流动性: ${MIN_LIQ_BREAKOUT:,}\n"
+        f"横盘高点突破要求: ≥{PRICE_BREAK_PCT}%\n"
+        "发送 /help 查看命令"
+    )
+
+    while True:
+        try:
+            process_telegram_commands()
+
+            breakout_watch = load_json(BREAKOUT_WATCH_FILE)
+            if not breakout_watch:
+                time.sleep(SCAN_INTERVAL)
                 continue
 
-            paprika_id, symbol, name = coin
+            history = update_price_history(breakout_watch)
+            cooldown = load_json(ALERT_COOLDOWN_FILE)
+            now = datetime.now(timezone.utc)
 
-            if is_price:
-                info = get_ticker_info(paprika_id)
-                if not info or info["circulating_supply"] <= 0:
-                    failed.append(f"{symbol}（无法获取流通量，请改用市值添加）")
+            for addr, meta in list(breakout_watch.items()):
+                raw = enrich_with_pair(addr)
+                if not raw:
                     continue
-                target_mcap = price * info["circulating_supply"]
-                added_msg = f"{symbol}（价格 ${price:,.2f} → 市值 {format_mcap(target_mcap)}）"
-            else:
-                added_msg = f"{symbol} ({name}) → ≤ {format_mcap(target_mcap)}"
-
-            exists = db_execute(
-                "SELECT id FROM watches WHERE user_id=? AND cg_id=?",
-                (user_id, paprika_id), fetch=True
-            )
-            if exists:
-                db_execute(
-                    "UPDATE watches SET target_mcap=?, cooldown_until=NULL WHERE user_id=? AND cg_id=?",
-                    (target_mcap, user_id, paprika_id)
-                )
-                added.append(f"{added_msg}（已更新）")
-            else:
-                db_execute(
-                    "INSERT INTO watches (user_id, symbol, cg_id, name, target_mcap, added_at) VALUES (?,?,?,?,?,?)",
-                    (user_id, symbol, paprika_id, name, target_mcap, datetime.utcnow().isoformat())
-                )
-                added.append(added_msg)
-
-            time.sleep(1.8)
-
-    msg = ""
-    if added:
-        msg += "✅ 已添加/更新：\n" + "\n".join(f"• {a}" for a in added)
-    if failed:
-        msg += "\n\n❌ 失败：\n" + "\n".join(f"• {f}" for f in failed)
-    if not msg:
-        msg = "没有识别到有效内容"
-    await update.message.reply_text(msg)
-
-
-async def receive_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    symbol_or_addr = context.user_data.get("pending_symbol")
-    if not symbol_or_addr:
-        await update.message.reply_text("请重新发送")
-        return ConversationHandler.END
-
-    value_str = update.message.text.strip()
-    target_mcap = parse_mcap(value_str)
-    is_price = False
-    price = None
-
-    if target_mcap is None:
-        price = parse_number(value_str)
-        if price is None:
-            await update.message.reply_text("格式错误，请输入市值（1.5T）或价格（78000）")
-            return WAITING_TARGET
-        is_price = True
-
-    coin = resolve_coin(symbol_or_addr)
-    if not coin:
-        await update.message.reply_text(f"找不到 {symbol_or_addr}")
-        return ConversationHandler.END
-
-    paprika_id, symbol, name = coin
-
-    if is_price:
-        info = get_ticker_info(paprika_id)
-        if not info or info["circulating_supply"] <= 0:
-            await update.message.reply_text("无法获取流通量，请改用市值添加")
-            return ConversationHandler.END
-        target_mcap = price * info["circulating_supply"]
-        tip = f"（由价格 ${price:,.2f} 换算）"
-    else:
-        tip = ""
-
-    exists = db_execute(
-        "SELECT id FROM watches WHERE user_id=? AND cg_id=?",
-        (user_id, paprika_id), fetch=True
-    )
-    if exists:
-        db_execute(
-            "UPDATE watches SET target_mcap=?, cooldown_until=NULL WHERE user_id=? AND cg_id=?",
-            (target_mcap, user_id, paprika_id)
-        )
-        await update.message.reply_text(f"✅ 已更新 {symbol} 目标市值 ≤ {format_mcap(target_mcap)}{tip}")
-    else:
-        db_execute(
-            "INSERT INTO watches (user_id, symbol, cg_id, name, target_mcap, added_at) VALUES (?,?,?,?,?,?)",
-            (user_id, symbol, paprika_id, name, target_mcap, datetime.utcnow().isoformat())
-        )
-        await update.message.reply_text(f"✅ 已添加 {symbol} ({name})\n目标市值 ≤ {format_mcap(target_mcap)}{tip}")
-
-    context.user_data.pop("pending_symbol", None)
-    return ConversationHandler.END
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("pending_symbol", None)
-    context.user_data.pop("confirm_removeall", None)
-    await update.message.reply_text("已取消")
-    return ConversationHandler.END
-
-
-# ==================== 定时检查 ====================
-async def check_all(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("开始执行市值检查任务...")
-    rows = db_execute(
-        "SELECT id, user_id, symbol, cg_id, name, target_mcap, cooldown_until FROM watches",
-        fetch=True
-    )
-    if not rows:
-        return
-
-    now = datetime.utcnow()
-    notified_count = 0
-
-    for row in rows:
-        watch_id, user_id, symbol, paprika_id, name, target, cooldown = row
-
-        if cooldown:
-            try:
-                if datetime.fromisoformat(cooldown) > now:
+                current = parse_pair(raw)
+                if not current:
                     continue
-            except:
-                pass
 
-        info = get_ticker_info(paprika_id)
-        if not info:
-            time.sleep(1.5)
-            continue
+                if not hard_quality_filter(current):
+                    continue
 
-        mcap = info["market_cap"]
-        price = info["price"]
+                hist = history.get(addr, [])
+                results = {
+                    "A": strategy_A_volume_price_break(hist, current),
+                    "B": strategy_B_consolidation_then_spike(hist, current),
+                    "C": strategy_C_momentum_buys(current),
+                    "D": strategy_D_combined(hist, current)
+                }
 
-        if mcap <= target:
-            if price < 0.01:
-                price_str = f"${price:.6f}"
-            elif price < 1:
-                price_str = f"${price:.4f}"
-            else:
-                price_str = f"${price:.2f}"
+                best_score = max(r["score"] for r in results.values())
+                if best_score < MIN_SCORE_BREAKOUT:
+                    continue
 
-            msg = (
-                f"🔔 *市值提醒*\n\n"
-                f"*{symbol}* ({name})\n"
-                f"当前价格：{price_str}\n"
-                f"当前市值：*{format_mcap(mcap)}*\n"
-                f"目标市值：*{format_mcap(target)}*\n"
-                f"已低于目标，可考虑关注。"
-            )
-            for i in range(NOTIFY_TIMES):
-                try:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=msg + f"\n\n（第 {i+1}/{NOTIFY_TIMES} 次通知）",
-                        parse_mode="Markdown"
-                    )
-                except Exception as e:
-                    logger.error(f"发送通知失败: {e}")
-                if i < NOTIFY_TIMES - 1:
-                    await asyncio.sleep(NOTIFY_INTERVAL_SECONDS)
+                last_alert = cooldown.get(addr)
+                if last_alert:
+                    last_dt = datetime.fromisoformat(last_alert)
+                    if (now - last_dt).total_seconds() < ALERT_COOLDOWN_HOURS * 3600:
+                        continue
 
-            cooldown_until = (now + timedelta(days=COOLDOWN_DAYS)).isoformat()
-            db_execute(
-                "UPDATE watches SET cooldown_until=?, last_notified=? WHERE id=?",
-                (cooldown_until, now.isoformat(), watch_id)
-            )
-            notified_count += 1
+                a, b, c, d = results["A"], results["B"], results["C"], results["D"]
+                msg = (
+                    f"<b>🚀 横盘突破信号 | 综合 {best_score}</b>\n\n"
+                    f"<b>{current['name']}</b>\n"
+                    f"年龄: {current['age_days']:.1f} 天\n"
+                    f"流动性: <b>${current['liquidity']:,.0f}</b>\n"
+                    f"FDV: ${current['fdv']:,.0f}\n"
+                    f"价格: ${current['price']:.8f}\n\n"
+                    f"<b>策略得分：</b>\n"
+                    f"A (量价突破): {a['score']} → {a['reason']}\n"
+                    f"B (横盘后放量): {b['score']} → {b['reason']}\n"
+                    f"C (买压动量): {c['score']} → {c['reason']}\n"
+                    f"D (综合): {d['score']}\n\n"
+                    f"<a href='{current['url']}'>DexScreener</a>\n"
+                    f"<code>{addr}</code>"
+                )
+                send_telegram(msg)
 
-        time.sleep(1.6)
+                cooldown[addr] = now.isoformat()
+                save_json(ALERT_COOLDOWN_FILE, cooldown)
 
-    logger.info(f"检查完成，共触发 {notified_count} 个提醒")
+            for addr in list(cooldown.keys()):
+                last_dt = datetime.fromisoformat(cooldown[addr])
+                if (now - last_dt).total_seconds() > ALERT_COOLDOWN_HOURS * 3600 * 2:
+                    del cooldown[addr]
+            save_json(ALERT_COOLDOWN_FILE, cooldown)
 
+            time.sleep(SCAN_INTERVAL)
 
-# ==================== 主程序 ====================
-def main():
-    init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    conv_add = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)],
-        states={
-            WAITING_TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_target)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-
-    conv_removeall = ConversationHandler(
-        entry_points=[CommandHandler("removeall", removeall_cmd)],
-        states={
-            CONFIRM_REMOVEALL: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_removeall)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("list", list_cmd))
-    app.add_handler(CommandHandler("edit", edit_cmd))
-    app.add_handler(CommandHandler("remove", remove_cmd))
-    app.add_handler(CommandHandler("mcap", mcap_cmd))
-    app.add_handler(CommandHandler("price", mcap_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(conv_removeall)
-    app.add_handler(conv_add)
-
-    job_queue = app.job_queue
-    job_queue.run_repeating(
-        check_all,
-        interval=CHECK_INTERVAL_HOURS * 3600,
-        first=30
-    )
-
-    logger.info("机器人启动成功（CoinPaprika + 价格/市值双模式）")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
+        except Exception as e:
+            print(f"主循环异常: {e}")
+            time.sleep(30)
 
 if __name__ == "__main__":
-    main()
+    main_loop()
