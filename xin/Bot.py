@@ -226,36 +226,36 @@ def handle_command(text: str, chat_id: str):
             send_telegram("该地址不在监控列表中", chat_id)
 
     elif text.startswith("/list"):
-    if not watch_list:
-        send_telegram("当前没有监控任何代币", chat_id)
-        return
-    
-    msg = "<b>📋 当前监控列表</b>\n\n"
-    for i, (addr, info) in enumerate(watch_list.items(), 1):
-        # 实时获取最新价格和流通市值
-        live = fetch_token_info(addr)
-        if live:
-            price = live["price"]
-            mcap = live["fdv"]
-            price_str = f"${price:.8f}" if price < 0.01 else f"${price:.6f}"
-            msg += (
-                f"{i}. <b>{info.get('name', 'Unknown')}</b>\n"
-                f"<code>{addr}</code>\n"
-                f"价格: <b>{price_str}</b> | 流通市值: ${mcap:,.0f}\n"
-                f"添加时间: {info.get('added_at', '-')}\n\n"
-            )
-        else:
-            msg += (
-                f"{i}. <b>{info.get('name', 'Unknown')}</b>\n"
-                f"<code>{addr}</code>\n"
-                f"价格: 获取失败\n"
-                f"添加时间: {info.get('added_at', '-')}\n\n"
-            )
-    
-    if len(msg) > 4000:
-        msg = msg[:3900] + "\n\n...（列表过长，已截断）"
-    
-    send_telegram(msg, chat_id)
+        if not watch_list:
+            send_telegram("当前没有监控任何代币", chat_id)
+            return
+        
+        msg = "<b>📋 当前监控列表</b>\n\n"
+        for i, (addr, info) in enumerate(watch_list.items(), 1):
+            # 实时获取最新价格和流通市值
+            live = fetch_token_info(addr)
+            if live:
+                price = live["price"]
+                mcap = live["fdv"]
+                price_str = f"${price:.8f}" if price < 0.01 else f"${price:.6f}"
+                msg += (
+                    f"{i}. <b>{info.get('name', 'Unknown')}</b>\n"
+                    f"<code>{addr}</code>\n"
+                    f"价格: <b>{price_str}</b> | 流通市值: ${mcap:,.0f}\n"
+                    f"添加时间: {info.get('added_at', '-')}\n\n"
+                )
+            else:
+                msg += (
+                    f"{i}. <b>{info.get('name', 'Unknown')}</b>\n"
+                    f"<code>{addr}</code>\n"
+                    f"价格: 获取失败\n"
+                    f"添加时间: {info.get('added_at', '-')}\n\n"
+                )
+        
+        if len(msg) > 4000:
+            msg = msg[:3900] + "\n\n...（列表过长，已截断）"
+        
+        send_telegram(msg, chat_id)
 
     elif text.startswith("/price"):
         parts = text.split()
