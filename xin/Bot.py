@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # ====================== 配置区 ======================
-TELEGRAM_BOT_TOKEN = os.getenv("8229035839:AAFfen2rHkpQB6hh1LW9cP8oYkQfoefcK_k", "")
-TELEGRAM_CHAT_ID = os.getenv("1085273843", "")
+TELEGRAM_BOT_TOKEN = "8229035839:AAFfen2rHkpQB6hh1LW9cP8oYkQfoefcK_k"
+TELEGRAM_CHAT_ID = "1085273843"
 
 SCAN_INTERVAL = 90
 SEEN_FILE = "seen_pools.json"
