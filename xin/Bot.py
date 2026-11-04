@@ -125,7 +125,7 @@ def fetch_token_info(token_address: str):
                 "name": f"{name} ({symbol})",
                 "symbol": symbol,
                 "price": float(best.get("priceUsd") or 0),
-                "fdv": float(best.get("fdv") or best.get("marketCap") or 0),
+                "fdv": float(best.get("marketCap") or best.get("fdv") or 0),  # 优先取流通市值
                 "liquidity": float(best.get("liquidity", {}).get("usd") or 0),
                 "pool_address": best.get("pairAddress", ""),
                 "url": best.get("url") or f"https://dexscreener.com/solana/{best.get('pairAddress', '')}",
@@ -204,7 +204,7 @@ def handle_command(text: str, chat_id: str):
                 f"✅ 已添加监控\n\n"
                 f"<b>{info['name']}</b>\n"
                 f"价格: ${info['price']:.8f}\n"
-                f"市值: ${info['fdv']:,.0f}\n"
+                f"流通市值: ${info['fdv']:,.0f}\n"
                 f"流动性: ${info['liquidity']:,.0f}",
                 chat_id
             )
