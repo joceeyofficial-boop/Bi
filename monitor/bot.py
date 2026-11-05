@@ -20,7 +20,7 @@ FOLLOWED_WALLETS_FILE = "followed_wallets.json"
 WALLET_BUY_RECORDS_FILE = "wallet_buy_records.json"
 
 # ====================== 成功率优先参数 ======================
-MIN_AGE_DAYS = 5
+MIN_AGE_DAYS = 0
 MAX_AGE_DAYS = 1000
 HISTORY_KEEP_DAYS = 365
 
