@@ -19,7 +19,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 
-POLL_INTERVAL = 25  # 轮询间隔（秒）
+POLL_INTERVAL = 30  # 轮询间隔（秒）
 # ==================================================
 
 logging.basicConfig(
@@ -87,19 +87,19 @@ def get_db():
     return sqlite3.connect(DB_PATH)
 
 
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
-
-
 # ------------------ Helius & DexScreener ------------------
 
 async def get_recent_parsed_transactions(wallet: str, limit: int = 20) -> list:
-    """获取地址最近的解析交易（稳定方式）"""
-    url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions/?api-key={HELIUS_API_KEY}&limit={limit}"
+    """完全按照你另一个能正常工作的机器人方式获取交易"""
+    url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions"
+    params = {
+        "api-key": HELIUS_API_KEY,
+        "limit": limit
+    }
 
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(url, timeout=20) as resp:
+            async with session.get(url, params=params, timeout=20) as resp:
                 if resp.status != 200:
                     text = await resp.text()
                     logger.error(f"获取交易失败 {resp.status}: {text[:200]}")
@@ -250,7 +250,7 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int, s
 
     day_number = max(1, (buy_ts - launch_ts) // 86400 + 1)
 
-    # 去重
+    # 去重检查
     conn = get_db()
     c = conn.cursor()
     c.execute(
@@ -261,7 +261,7 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int, s
         conn.close()
         return
 
-    # 更新成本
+    # 更新成本基础
     cost_this_buy = token_amount * price_usd
     c.execute("""
         INSERT INTO cost_basis (wallet, mint, total_tokens, total_cost_usd)
@@ -282,7 +282,7 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int, s
     )
     conn.commit()
 
-    # 持仓占比 & 平均成本
+    # 计算持仓占比和平均成本
     balance = await get_token_balance(wallet, mint)
     supply = await get_token_supply(mint)
     holding_pct = (balance / supply * 100) if supply > 0 else 0.0
@@ -293,8 +293,7 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int, s
     conn.close()
 
     short_wallet = wallet[:6] + "..." + wallet[-4:]
-    age_seconds = buy_ts - launch_ts
-    age_str = format_age(age_seconds)
+    age_str = format_age(buy_ts - launch_ts)
 
     text = (
         f"聪明钱买入提醒\n\n"
@@ -335,7 +334,7 @@ def format_age(seconds: int) -> str:
     return f"{seconds // 86400}天"
 
 
-# ------------------ 命令 ------------------
+# ------------------ 命令处理 ------------------
 
 @router.message(Command("start"), F.from_user.id == ADMIN_ID)
 @router.message(Command("help"), F.from_user.id == ADMIN_ID)
@@ -444,7 +443,6 @@ async def cmd_list(message: Message):
     for i, (mint, symbol, name, count, total_tokens, total_cost) in enumerate(rows, 1):
         symbol = symbol or "UNKNOWN"
         avg_cost = (total_cost / total_tokens) if total_tokens and total_tokens > 0 else 0
-
         info = await get_dexscreener_info(mint)
         mcap = format_number(info.get("market_cap", 0))
 
