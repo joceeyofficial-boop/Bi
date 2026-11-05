@@ -110,17 +110,25 @@ async def get_signatures(address: str, limit: int = 20, before: str = None) -> L
     return result or []
 
 async def get_parsed_transaction(signature: str) -> Optional[dict]:
-    # 使用 Helius enhanced 解析
+    """使用 Helius 增强交易解析"""
     url = f"https://api.helius.xyz/v0/transactions/?api-key={HELIUS_API_KEY}"
+    headers = {"Content-Type": "application/json"}
+    payload = {"transactions": [signature]}
+    
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.post(url, json={"transactions": [signature]}, timeout=15) as resp:
+            async with session.post(url, json=payload, headers=headers, timeout=20) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error(f"Parsed tx error: {resp.status}, message={text[:200]}")
+                    return None
                 data = await resp.json()
                 if data and isinstance(data, list) and len(data) > 0:
                     return data[0]
+                return None
         except Exception as e:
-            logger.error(f"Parsed tx error: {e}")
-    return None
+            logger.error(f"Parsed tx exception: {e}")
+            return None
 
 async def get_token_balance(wallet: str, mint: str) -> float:
     """获取钱包对某代币的持仓数量"""
