@@ -19,13 +19,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 
-POLL_INTERVAL = 30  # 轮询间隔（秒）
+POLL_INTERVAL = 30
 # ==================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -39,7 +36,6 @@ DB_PATH = "smart_money_bot.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-
     c.execute("""
         CREATE TABLE IF NOT EXISTS tracked_wallets (
             address TEXT PRIMARY KEY,
@@ -48,7 +44,6 @@ def init_db():
             status TEXT DEFAULT 'normal'
         )
     """)
-
     c.execute("""
         CREATE TABLE IF NOT EXISTS notified (
             wallet TEXT,
@@ -59,7 +54,6 @@ def init_db():
             PRIMARY KEY (wallet, mint, day_number)
         )
     """)
-
     c.execute("""
         CREATE TABLE IF NOT EXISTS cost_basis (
             wallet TEXT,
@@ -69,7 +63,6 @@ def init_db():
             PRIMARY KEY (wallet, mint)
         )
     """)
-
     c.execute("""
         CREATE TABLE IF NOT EXISTS token_info (
             mint TEXT PRIMARY KEY,
@@ -78,7 +71,6 @@ def init_db():
             launch_ts INTEGER
         )
     """)
-
     conn.commit()
     conn.close()
 
@@ -87,15 +79,10 @@ def get_db():
     return sqlite3.connect(DB_PATH)
 
 
-# ------------------ Helius & DexScreener ------------------
-
 async def get_recent_parsed_transactions(wallet: str, limit: int = 20) -> list:
-    """完全按照你另一个能正常工作的机器人方式获取交易"""
+    """按照能正常工作的方式获取交易"""
     url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions"
-    params = {
-        "api-key": HELIUS_API_KEY,
-        "limit": limit
-    }
+    params = {"api-key": HELIUS_API_KEY, "limit": limit}
 
     async with aiohttp.ClientSession() as session:
         try:
@@ -114,21 +101,15 @@ async def get_recent_parsed_transactions(wallet: str, limit: int = 20) -> list:
 async def get_token_balance(wallet: str, mint: str) -> float:
     url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
     payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
+        "jsonrpc": "2.0", "id": 1,
         "method": "getTokenAccountsByOwner",
-        "params": [
-            wallet,
-            {"mint": mint},
-            {"encoding": "jsonParsed"}
-        ]
+        "params": [wallet, {"mint": mint}, {"encoding": "jsonParsed"}]
     }
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(url, json=payload, timeout=15) as resp:
                 data = await resp.json()
-                result = data.get("result", {})
-                values = result.get("value", [])
+                values = data.get("result", {}).get("value", [])
                 if values:
                     amount = values[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"]
                     return float(amount or 0)
@@ -140,8 +121,7 @@ async def get_token_balance(wallet: str, mint: str) -> float:
 async def get_token_supply(mint: str) -> float:
     url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
     payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
+        "jsonrpc": "2.0", "id": 1,
         "method": "getTokenSupply",
         "params": [mint]
     }
@@ -166,11 +146,7 @@ async def get_dexscreener_info(mint: str) -> Dict[str, Any]:
                 if not pairs:
                     return {}
                 pair = max(pairs, key=lambda x: (x.get("liquidity") or {}).get("usd") or 0)
-
-                launch_ts = None
-                if pair.get("pairCreatedAt"):
-                    launch_ts = int(pair["pairCreatedAt"] / 1000)
-
+                launch_ts = int(pair["pairCreatedAt"] / 1000) if pair.get("pairCreatedAt") else None
                 return {
                     "symbol": pair.get("baseToken", {}).get("symbol", "UNKNOWN"),
                     "name": pair.get("baseToken", {}).get("name", "Unknown"),
@@ -183,8 +159,6 @@ async def get_dexscreener_info(mint: str) -> Dict[str, Any]:
             logger.error(f"DexScreener 错误: {e}")
     return {}
 
-
-# ------------------ 核心业务逻辑 ------------------
 
 async def process_new_buys(wallet: str):
     conn = get_db()
@@ -205,6 +179,10 @@ async def process_new_buys(wallet: str):
         logger.info(f"钱包 {wallet[:8]}... 发现 {len(new_txs)} 笔新交易")
 
     for tx in new_txs:
+        # 只处理真正的 SWAP 交易
+        if tx.get("type") != "SWAP":
+            continue
+
         signature = tx.get("signature")
         timestamp = tx.get("timestamp", int(time.time()))
 
@@ -240,28 +218,30 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int, s
     launch_ts = info.get("launch_ts")
     price_usd = info.get("price_usd", 0)
 
-    if not launch_ts:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT launch_ts FROM token_info WHERE mint = ?", (mint,))
-        row = c.fetchone()
-        conn.close()
-        launch_ts = row[0] if row else buy_ts
+    # 计算第几天（更合理）
+    day_number = None
+    age_str = "未知"
+    if launch_ts and launch_ts > 1600000000:  # 简单校验时间戳是否合理
+        day_number = max(1, (buy_ts - launch_ts) // 86400 + 1)
+        # 防止异常大的数字
+        if day_number > 365:
+            day_number = None
+        age_str = format_age(buy_ts - launch_ts)
 
-    day_number = max(1, (buy_ts - launch_ts) // 86400 + 1)
+    # 去重键：如果没有有效的 day_number，就用 0 代表“当天”
+    dedup_day = day_number if day_number is not None else 0
 
-    # 去重检查
     conn = get_db()
     c = conn.cursor()
     c.execute(
         "SELECT 1 FROM notified WHERE wallet=? AND mint=? AND day_number=?",
-        (wallet, mint, day_number)
+        (wallet, mint, dedup_day)
     )
     if c.fetchone():
         conn.close()
         return
 
-    # 更新成本基础
+    # 更新成本
     cost_this_buy = token_amount * price_usd
     c.execute("""
         INSERT INTO cost_basis (wallet, mint, total_tokens, total_cost_usd)
@@ -273,16 +253,14 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int, s
 
     c.execute(
         "INSERT INTO notified (wallet, mint, day_number, notified_at, tx_signature) VALUES (?, ?, ?, ?, ?)",
-        (wallet, mint, day_number, int(time.time()), signature)
+        (wallet, mint, dedup_day, int(time.time()), signature)
     )
-
     c.execute(
         "INSERT OR REPLACE INTO token_info (mint, symbol, name, launch_ts) VALUES (?, ?, ?, ?)",
-        (mint, symbol, name, launch_ts)
+        (mint, symbol, name, launch_ts or 0)
     )
     conn.commit()
 
-    # 计算持仓占比和平均成本
     balance = await get_token_balance(wallet, mint)
     supply = await get_token_supply(mint)
     holding_pct = (balance / supply * 100) if supply > 0 else 0.0
@@ -293,13 +271,18 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int, s
     conn.close()
 
     short_wallet = wallet[:6] + "..." + wallet[-4:]
-    age_str = format_age(buy_ts - launch_ts)
+
+    # 通知文案
+    if day_number is not None:
+        times_text = f"**这是第 {day_number} 次买入该代币**"
+    else:
+        times_text = "**买入提醒**"
 
     text = (
         f"聪明钱买入提醒\n\n"
         f"钱包: `{short_wallet}`\n"
         f"代币: {name} (${symbol})\n"
-        f"**这是第 {day_number} 次买入该代币**\n\n"
+        f"{times_text}\n\n"
         f"流动性: {format_number(info.get('liquidity', 0))}\n"
         f"市值: {format_number(info.get('market_cap', 0))}\n"
         f"年龄: {age_str}\n"
@@ -311,7 +294,7 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int, s
 
     try:
         await bot.send_message(ADMIN_ID, text, parse_mode="Markdown")
-        logger.info(f"通知成功: ${symbol} 第{day_number}次")
+        logger.info(f"通知成功: ${symbol} {'第'+str(day_number)+'次' if day_number else '买入'}")
     except Exception as e:
         logger.error(f"发送通知失败: {e}")
 
@@ -334,12 +317,12 @@ def format_age(seconds: int) -> str:
     return f"{seconds // 86400}天"
 
 
-# ------------------ 命令处理 ------------------
+# ------------------ 命令 ------------------
 
 @router.message(Command("start"), F.from_user.id == ADMIN_ID)
 @router.message(Command("help"), F.from_user.id == ADMIN_ID)
 async def cmd_help(message: Message):
-    text = (
+    await message.answer(
         "聪明钱跟踪 Bot\n\n"
         "/follow 钱包地址 - 开始跟踪\n"
         "/unfollow 钱包地址 - 取消跟踪\n"
@@ -349,7 +332,6 @@ async def cmd_help(message: Message):
         "/status - 运行状态\n"
         "/help - 帮助"
     )
-    await message.answer(text)
 
 
 @router.message(Command("follow"), F.from_user.id == ADMIN_ID)
@@ -364,9 +346,10 @@ async def cmd_follow(message: Message, command: CommandObject):
 
     conn = get_db()
     c = conn.cursor()
+    # 添加时把 last_checked 设为当前时间，避免通知历史交易
     c.execute(
         "INSERT OR IGNORE INTO tracked_wallets (address, added_at, last_checked) VALUES (?, ?, ?)",
-        (address, int(time.time()), int(time.time()) - 3600)
+        (address, int(time.time()), int(time.time()))
     )
     conn.commit()
     conn.close()
@@ -394,17 +377,14 @@ async def cmd_follows(message: Message):
     c.execute("SELECT address, status, last_checked FROM tracked_wallets")
     rows = c.fetchall()
     conn.close()
-
     if not rows:
         await message.answer("当前没有跟踪任何地址")
         return
-
     text = "当前跟踪列表:\n\n"
     for addr, status, last in rows:
         short = addr[:6] + "..." + addr[-4:]
         last_str = datetime.fromtimestamp(last).strftime("%m-%d %H:%M") if last else "无"
-        status_emoji = "✅" if status == "normal" else "⚠️"
-        text += f"{status_emoji} `{short}`\n状态: {status} | 最后检查: {last_str}\n\n"
+        text += f"✅ `{short}`\n状态: {status} | 最后检查: {last_str}\n\n"
     await message.answer(text, parse_mode="Markdown")
 
 
@@ -423,34 +403,25 @@ async def cmd_list(message: Message):
     conn = get_db()
     c = conn.cursor()
     c.execute("""
-        SELECT n.mint, t.symbol, t.name, COUNT(*) as alert_count,
-               cb.total_tokens, cb.total_cost_usd
+        SELECT n.mint, t.symbol, COUNT(*) as alert_count, cb.total_tokens, cb.total_cost_usd
         FROM notified n
         LEFT JOIN token_info t ON n.mint = t.mint
         LEFT JOIN cost_basis cb ON n.wallet = cb.wallet AND n.mint = cb.mint
         GROUP BY n.mint
-        ORDER BY alert_count DESC
-        LIMIT 30
+        ORDER BY alert_count DESC LIMIT 30
     """)
     rows = c.fetchall()
     conn.close()
-
     if not rows:
         await message.answer("暂无已通知记录")
         return
-
-    text = "已通知代币列表（按报警次数排序）\n\n"
-    for i, (mint, symbol, name, count, total_tokens, total_cost) in enumerate(rows, 1):
+    text = "已通知代币列表\n\n"
+    for i, (mint, symbol, count, total_tokens, total_cost) in enumerate(rows, 1):
         symbol = symbol or "UNKNOWN"
         avg_cost = (total_cost / total_tokens) if total_tokens and total_tokens > 0 else 0
         info = await get_dexscreener_info(mint)
         mcap = format_number(info.get("market_cap", 0))
-
-        text += (
-            f"{i}. ${symbol}\n"
-            f"市值: {mcap} | 报警次数: {count}次\n"
-            f"平均成本: ${avg_cost:.8f}\n\n"
-        )
+        text += f"{i}. ${symbol}\n市值: {mcap} | 报警: {count}次\n平均成本: ${avg_cost:.8f}\n\n"
     await message.answer(text)
 
 
@@ -466,8 +437,6 @@ async def cmd_status(message: Message):
     await message.answer(f"运行正常\n跟踪地址数: {wallet_count}\n累计通知次数: {notify_count}")
 
 
-# ------------------ 后台轮询 ------------------
-
 async def polling_loop():
     while True:
         try:
@@ -476,21 +445,18 @@ async def polling_loop():
             c.execute("SELECT address FROM tracked_wallets")
             wallets = [row[0] for row in c.fetchall()]
             conn.close()
-
             for wallet in wallets:
                 await process_new_buys(wallet)
                 await asyncio.sleep(1.5)
         except Exception as e:
             logger.error(f"轮询错误: {e}")
-
         await asyncio.sleep(POLL_INTERVAL)
 
 
 async def main():
     if not TELEGRAM_BOT_TOKEN or not HELIUS_API_KEY or ADMIN_ID == 0:
-        logger.error("请检查环境变量 TELEGRAM_BOT_TOKEN / ADMIN_ID / HELIUS_API_KEY 是否设置正确")
+        logger.error("请检查环境变量 TELEGRAM_BOT_TOKEN / ADMIN_ID / HELIUS_API_KEY")
         return
-
     init_db()
     logger.info("Bot 启动中...")
     asyncio.create_task(polling_loop())
