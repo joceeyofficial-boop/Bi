@@ -16,9 +16,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== 配置区域（请填写） ====================
-TELEGRAM_BOT_TOKEN = os.getenv("9214707700:AAHvpLbqfyXsoL2buizCEn6FwSQA8ECpP-w", "在这里填写你的Bot Token")
-ADMIN_ID = int(os.getenv("1085273843", "在这里填写你的Telegram数字ID"))  # 例如 123456789
-HELIUS_API_KEY = os.getenv("5c1698fe-e1ed-495a-ac3f-11a28bf79145", "在这里填写你的Helius API Key")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9214707700:AAHvpLbqfyXsoL2buizCEn6FwSQA8ECpP-w")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "1085273843"))  # 例如 123456789
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "5c1698fe-e1ed-495a-ac3f-11a28bf79145")
 
 # 轮询间隔（秒）
 POLL_INTERVAL = 20
