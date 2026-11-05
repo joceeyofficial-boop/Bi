@@ -1,23 +1,28 @@
 import time
 import requests
 import json
+import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ====================== 配置区 ======================
-TELEGRAM_BOT_TOKEN = "8648405680:AAEVSH8reK5x1tXuyl_e4nfeA8-9Nz2gcPA"          # ← 在这里填入你的 Bot Token
-TELEGRAM_CHAT_ID   = "1085273843"          # ← 在这里填入你的 Chat ID
+TELEGRAM_BOT_TOKEN = "8648405680:AAEVSH8reK5x1tXuyl_e4nfeA8-9Nz2gcPA"          # ← 填入你的 Bot Token
+TELEGRAM_CHAT_ID   = "1085273843"          # ← 填入你的 Chat ID
+HELIUS_API_KEY     = "5c1698fe-e1ed-495a-ac3f-11a28bf79145"          # ← 填入你的 Helius API Key
 
-SCAN_INTERVAL = 90               # 主循环间隔（秒）
+SCAN_INTERVAL = 90               # 横盘突破主循环间隔（秒）
+WALLET_CHECK_INTERVAL = 120      # 钱包检查间隔（秒）= 2分钟
 
 BREAKOUT_WATCH_FILE = "breakout_watch.json"
 HISTORY_FILE = "price_history.json"
 ALERT_COOLDOWN_FILE = "alert_cooldown.json"
+FOLLOWED_WALLETS_FILE = "followed_wallets.json"
+WALLET_BUY_RECORDS_FILE = "wallet_buy_records.json"
 
 # ====================== 成功率优先参数 ======================
 MIN_AGE_DAYS = 5
-MAX_AGE_DAYS = 1000                  # 最大存活天数改为1000天
-HISTORY_KEEP_DAYS = 14
+MAX_AGE_DAYS = 1000
+HISTORY_KEEP_DAYS = 365
 
 CONSOL_HOURS = 18
 CONSOL_MAX_RANGE_PCT = 16
@@ -89,12 +94,14 @@ def get_updates():
     if not TELEGRAM_BOT_TOKEN:
         return []
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"offset": last_update_id + 1, "timeout": 10}
+    params = {"offset": last_update_id + 1, "timeout": 8}
     try:
-        r = session.get(url, params=params, timeout=15)
+        r = session.get(url, params=params, timeout=12)
         if r.status_code == 200:
             data = r.json()
             return data.get("result", [])
+        elif r.status_code == 409:
+            print("getUpdates 409 Conflict：可能有其他实例正在运行，或设置了Webhook")
         else:
             print(f"getUpdates 失败 status={r.status_code}")
     except Exception as e:
@@ -137,7 +144,8 @@ def fetch_token_info(token_address: str):
             "volume_24h": float(best.get("volume", {}).get("h24") or 0),
             "price_change_24h": float(best.get("priceChange", {}).get("h24") or 0),
             "pairCreatedAt": created,
-            "age_days": age_days
+            "age_days": age_days,
+            "token_address": base.get("address", token_address)
         }
     except Exception as e:
         print(f"fetch_token_info 失败: {e}")
@@ -418,22 +426,186 @@ def hard_quality_filter(current: dict) -> bool:
         return False
     return True
 
+# ====================== 聪明钱钱包跟踪（Helius）======================
+def get_wallet_transactions(wallet: str, limit: int = 20):
+    """获取钱包最近交易（Helius Enhanced Transactions）"""
+    if not HELIUS_API_KEY:
+        return []
+    url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions"
+    params = {
+        "api-key": HELIUS_API_KEY,
+        "limit": limit
+    }
+    try:
+        r = session.get(url, params=params, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+        else:
+            print(f"Helius交易获取失败 status={r.status_code}")
+    except Exception as e:
+        print(f"Helius交易异常: {e}")
+    return []
+
+def get_token_balance_and_supply(wallet: str, token_mint: str):
+    """获取钱包持仓数量和代币总供应量（用于计算持仓占比）"""
+    if not HELIUS_API_KEY:
+        return None, None
+
+    # 使用 Helius RPC
+    rpc_url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+
+    # 1. 获取钱包该代币余额
+    balance_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTokenAccountsByOwner",
+        "params": [
+            wallet,
+            {"mint": token_mint},
+            {"encoding": "jsonParsed"}
+        ]
+    }
+    try:
+        r = session.post(rpc_url, json=balance_payload, timeout=12)
+        data = r.json()
+        accounts = data.get("result", {}).get("value", [])
+        balance = 0
+        if accounts:
+            for acc in accounts:
+                info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                token_amount = info.get("tokenAmount", {})
+                balance += float(token_amount.get("uiAmount") or 0)
+    except Exception as e:
+        print(f"获取余额失败: {e}")
+        balance = 0
+
+    # 2. 获取代币总供应量
+    supply_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTokenSupply",
+        "params": [token_mint]
+    }
+    try:
+        r = session.post(rpc_url, json=supply_payload, timeout=12)
+        data = r.json()
+        supply_info = data.get("result", {}).get("value", {})
+        supply = float(supply_info.get("uiAmount") or 0)
+    except Exception as e:
+        print(f"获取供应量失败: {e}")
+        supply = 0
+
+    return balance, supply
+
+def extract_buy_tokens(tx: dict, wallet: str):
+    """从交易中提取该钱包买入的代币（简化版，优先识别SWAP）"""
+    buys = []
+    try:
+        # Helius 增强交易格式
+        if tx.get("type") == "SWAP":
+            # 检查 tokenTransfers
+            for transfer in tx.get("tokenTransfers", []):
+                if transfer.get("toUserAccount") == wallet:
+                    mint = transfer.get("mint")
+                    if mint and mint != "So11111111111111111111111111111111111111112":  # 排除SOL
+                        buys.append({
+                            "mint": mint,
+                            "amount": float(transfer.get("tokenAmount") or 0),
+                            "timestamp": tx.get("timestamp")
+                        })
+        # 也可以从 accountData 等进一步解析，这里先用增强字段
+    except Exception as e:
+        print(f"解析交易失败: {e}")
+    return buys
+
+def check_wallet_buys():
+    """检查所有跟踪钱包的买入行为"""
+    if not HELIUS_API_KEY:
+        return
+
+    followed = load_json(FOLLOWED_WALLETS_FILE)
+    if not followed:
+        return
+
+    records = load_json(WALLET_BUY_RECORDS_FILE)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    for wallet, meta in list(followed.items()):
+        try:
+            txs = get_wallet_transactions(wallet, limit=15)
+            if not txs:
+                continue
+
+            for tx in txs:
+                buy_list = extract_buy_tokens(tx, wallet)
+                for buy in buy_list:
+                    mint = buy["mint"]
+                    key = f"{wallet}|{mint}"
+
+                    # 检查今天是否已经通知过
+                    day_list = records.get(key, [])
+                    if today in day_list:
+                        continue
+
+                    # 计算是第几次（按不同日期）
+                    times = len(day_list) + 1
+
+                    # 获取代币信息
+                    token_info = fetch_token_info(mint)
+                    name = token_info["name"] if token_info else mint[:8] + "..."
+
+                    # 获取持仓占比
+                    balance, supply = get_token_balance_and_supply(wallet, mint)
+                    hold_pct = 0
+                    if balance and supply and supply > 0:
+                        hold_pct = (balance / supply) * 100
+
+                    # 发送通知
+                    short_wallet = wallet[:6] + "..." + wallet[-4:]
+                    msg = (
+                        f"<b>🔔 聪明钱买入提醒</b>\n\n"
+                        f"钱包：<code>{short_wallet}</code>\n"
+                        f"代币：<b>{name}</b>\n"
+                        f"这是第 <b>{times}</b> 次买入该代币\n\n"
+                        f"当前持仓占比：<b>{hold_pct:.2f}%</b>\n"
+                        f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                        f"<code>{mint}</code>"
+                    )
+                    send_telegram(msg)
+
+                    # 记录今天已通知
+                    day_list.append(today)
+                    records[key] = day_list
+                    save_json(WALLET_BUY_RECORDS_FILE, records)
+
+                    print(f"已通知聪明钱买入: {name} | 第{times}次 | 持仓{hold_pct:.2f}%")
+
+        except Exception as e:
+            print(f"检查钱包 {wallet[:8]} 异常: {e}")
+
 # ====================== 命令处理 ======================
 def handle_command(text: str, chat_id: str):
     text = text.strip()
     breakout_watch = load_json(BREAKOUT_WATCH_FILE)
+    followed = load_json(FOLLOWED_WALLETS_FILE)
 
     if text.startswith("/start") or text.startswith("/help"):
         msg = (
-            "<b>🤖 横盘突破监控机器人（成功率优先）</b>\n\n"
+            "<b>🤖 横盘突破 + 聪明钱监控机器人</b>\n\n"
+            "【横盘突破监控】\n"
             "专注上线 5~1000 天代币\n"
             "捕捉横盘后放量突破（突破高点≥15%）\n\n"
-            "<b>命令：</b>\n"
+            "<b>横盘命令：</b>\n"
             "/bwatch 合约地址 - 加入监控\n"
             "/bunwatch 合约地址 - 删除监控\n"
             "/blist - 查看监控列表\n"
             "/bclear - 清空全部\n"
-            "/price 合约地址 - 查看数据\n"
+            "/price 合约地址 - 查看数据\n\n"
+            "【聪明钱跟踪】\n"
+            "/follow 钱包地址 - 开始跟踪\n"
+            "/unfollow 钱包地址 - 取消跟踪\n"
+            "/follows - 查看跟踪列表\n"
+            "/followclear - 清空跟踪\n\n"
             "/status - 运行状态\n"
             "/help"
         )
@@ -444,9 +616,10 @@ def handle_command(text: str, chat_id: str):
         cooldown = load_json(ALERT_COOLDOWN_FILE)
         msg = (
             f"<b>📊 运行状态</b>\n\n"
-            f"当前监控: {len(breakout_watch)}\n"
+            f"横盘监控: {len(breakout_watch)}\n"
             f"历史币种: {len(history)}\n"
             f"冷却中: {len(cooldown)}\n"
+            f"聪明钱跟踪: {len(followed)}\n"
             f"年龄范围: {MIN_AGE_DAYS}~{MAX_AGE_DAYS}天\n"
             f"最低流动性: ${MIN_LIQ_BREAKOUT:,}\n"
             f"突破要求: ≥{PRICE_BREAK_PCT}%\n"
@@ -455,6 +628,7 @@ def handle_command(text: str, chat_id: str):
         )
         send_telegram(msg, chat_id)
 
+    # ---------- 横盘突破命令 ----------
     elif text.startswith("/bwatch"):
         parts = text.split()
         if len(parts) < 2:
@@ -543,6 +717,52 @@ def handle_command(text: str, chat_id: str):
         else:
             send_telegram("❌ 获取失败", chat_id)
 
+    # ---------- 聪明钱跟踪命令 ----------
+    elif text.startswith("/follow"):
+        parts = text.split()
+        if len(parts) < 2:
+            send_telegram("格式：\n<code>/follow 钱包地址</code>", chat_id)
+            return
+        wallet = parts[1].strip()
+        if len(wallet) < 32:
+            send_telegram("❌ 钱包地址格式不正确", chat_id)
+            return
+
+        followed[wallet] = {
+            "added_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "note": ""
+        }
+        save_json(FOLLOWED_WALLETS_FILE, followed)
+        short = wallet[:6] + "..." + wallet[-4:]
+        send_telegram(f"✅ 已开始跟踪钱包\n<code>{short}</code>\n\n之后该钱包买入代币会通知你（每天每个币只通知一次）", chat_id)
+
+    elif text.startswith("/unfollow"):
+        parts = text.split()
+        if len(parts) < 2:
+            send_telegram("格式：\n<code>/unfollow 钱包地址</code>", chat_id)
+            return
+        wallet = parts[1].strip()
+        if wallet in followed:
+            del followed[wallet]
+            save_json(FOLLOWED_WALLETS_FILE, followed)
+            send_telegram("✅ 已取消跟踪", chat_id)
+        else:
+            send_telegram("该钱包不在跟踪列表中", chat_id)
+
+    elif text.startswith("/follows"):
+        if not followed:
+            send_telegram("当前没有跟踪任何钱包", chat_id)
+            return
+        msg = "<b>👁 当前跟踪的钱包</b>\n\n"
+        for i, (w, info) in enumerate(followed.items(), 1):
+            short = w[:6] + "..." + w[-4:]
+            msg += f"{i}. <code>{short}</code>\n添加: {info.get('added_at')}\n\n"
+        send_telegram(msg, chat_id)
+
+    elif text.startswith("/followclear"):
+        save_json(FOLLOWED_WALLETS_FILE, {})
+        send_telegram("✅ 已清空所有跟踪钱包", chat_id)
+
     else:
         send_telegram("未知命令，请输入 /help", chat_id)
 
@@ -567,29 +787,57 @@ def process_telegram_commands():
             print(f"处理命令异常: {e}")
             send_telegram(f"处理命令时出错: {e}", chat_id)
 
+def command_loop():
+    while True:
+        try:
+            process_telegram_commands()
+            time.sleep(2)
+        except Exception as e:
+            print(f"命令线程异常: {e}")
+            time.sleep(5)
+
+def wallet_loop():
+    """独立线程检查聪明钱买入"""
+    while True:
+        try:
+            check_wallet_buys()
+            time.sleep(WALLET_CHECK_INTERVAL)
+        except Exception as e:
+            print(f"钱包检查线程异常: {e}")
+            time.sleep(30)
+
 # ====================== 主循环 ======================
 def main_loop():
     print("=" * 55)
-    print("横盘突破监控机器人启动（成功率优先 | 年龄5-1000天 | 突破≥15%）")
+    print("横盘突破 + 聪明钱监控机器人启动")
     print(f"TOKEN 是否设置: {'是' if TELEGRAM_BOT_TOKEN else '否'}")
     print(f"CHAT_ID 是否设置: {'是' if TELEGRAM_CHAT_ID else '否'}")
+    print(f"HELIUS 是否设置: {'是' if HELIUS_API_KEY else '否'}")
     print("=" * 55)
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("警告：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未设置！")
+    if not HELIUS_API_KEY:
+        print("警告：HELIUS_API_KEY 未设置，聪明钱跟踪功能将无法使用！")
+
+    # 启动命令处理线程
+    t1 = threading.Thread(target=command_loop, daemon=True)
+    t1.start()
+
+    # 启动钱包检查线程
+    t2 = threading.Thread(target=wallet_loop, daemon=True)
+    t2.start()
 
     send_telegram(
-        "🤖 机器人已启动（成功率优先版）\n"
+        "🤖 机器人已启动（横盘突破 + 聪明钱跟踪）\n"
         f"年龄范围: {MIN_AGE_DAYS}~{MAX_AGE_DAYS}天\n"
         f"最低流动性: ${MIN_LIQ_BREAKOUT:,}\n"
         f"横盘高点突破要求: ≥{PRICE_BREAK_PCT}%\n"
-        "发送 /help 查看命令"
+        "发送 /help 查看全部命令"
     )
 
     while True:
         try:
-            process_telegram_commands()
-
             breakout_watch = load_json(BREAKOUT_WATCH_FILE)
             if not breakout_watch:
                 time.sleep(SCAN_INTERVAL)
