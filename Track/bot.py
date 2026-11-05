@@ -306,7 +306,7 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int, s
         f"当前持仓占比: {holding_pct:.2f}%\n"
         f"平均成本价: ${avg_cost:.8f}\n\n"
         f"时间: {datetime.fromtimestamp(buy_ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')}\n"
-        f"Tx: `{signature}`"
+        f"合约: `{mint}`"
     )
 
     try:
