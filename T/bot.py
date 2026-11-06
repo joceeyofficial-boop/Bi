@@ -323,7 +323,6 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int, s
 
     buy_date = datetime.fromtimestamp(buy_ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
-    # 同一天只通知一次
     conn = get_db()
     c = conn.cursor()
     c.execute(
@@ -363,8 +362,22 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int, s
 
     c.execute("SELECT total_tokens, total_cost_usd FROM cost_basis WHERE wallet=? AND mint=?", (wallet, mint))
     row = c.fetchone()
-    avg_cost = (row[1] / row[0]) if row and row[0] > 0 else price_usd
+    total_tokens = row[0] if row else 0
+    total_cost = row[1] if row else 0
+    avg_cost = (total_cost / total_tokens) if total_tokens > 0 else price_usd
     conn.close()
+
+    # 计算总盈亏（未实现）
+    current_value = balance * price_usd
+    cost_value = balance * avg_cost if avg_cost > 0 else 0
+    pnl_usd = current_value - cost_value
+    pnl_pct = ((price_usd / avg_cost) - 1) * 100 if avg_cost > 0 else 0
+
+    # 盈亏显示颜色/符号
+    if pnl_usd >= 0:
+        pnl_text = f"+${pnl_usd:,.2f} (+{pnl_pct:.2f}%)"
+    else:
+        pnl_text = f"-${abs(pnl_usd):,.2f} ({pnl_pct:.2f}%)"
 
     age_str = "未知"
     if launch_ts and launch_ts > 1600000000:
@@ -378,7 +391,8 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int, s
         f"钱包: <code>{short_wallet}</code>\n"
         f"代币: {name} (${symbol})\n\n"
         f"当前价格: ${price_usd:.8f}\n"
-        f"平均成本: <b>${avg_cost:.8f}</b>\n"
+        f"平均成本（跟踪后）: <b>${avg_cost:.8f}</b>\n"
+        f"总盈亏: <b>{pnl_text}</b>\n"
         f"持仓占比: {holding_pct:.2f}%\n"
         f"流动性: {format_number(info.get('liquidity', 0))}\n"
         f"市值: {format_number(info.get('market_cap', 0))}\n"
@@ -389,7 +403,7 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int, s
 
     try:
         await bot.send_message(ADMIN_ID, text, parse_mode="HTML")
-        logger.info(f"通知成功: ${symbol} 第{times}次 | 连续{consecutive}天")
+        logger.info(f"通知成功: ${symbol} 第{times}次 | 连续{consecutive}天 | 盈亏{pnl_text}")
     except Exception as e:
         logger.error(f"发送通知失败: {e}")
 
