@@ -3,12 +3,8 @@ import logging
 import os
 import sqlite3
 import time
-import hmac
-import hashlib
-import base64
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
-from urllib.parse import urlencode
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
@@ -22,16 +18,13 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-OKX_API_KEY = os.getenv("OKX_API_KEY", "")
-OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY", "")
-OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
+# GMGN 相关（如果有官方 API Key 可填，没有则走公开接口）
+GMGN_API_KEY = os.getenv("GMGN_API_KEY", "")
 
-CHAIN_INDEX = "501"
-
-POLL_INTERVAL = 180
+POLL_INTERVAL = 120              # 2分钟检查一次
 MIN_BUY_USD = 300.0              # 单笔低于此金额不通知
-HIGHLIGHT_BUY_USD = 500.0        # 单笔较大时额外高亮
-EARLY_STAGE_MAX_COST = 2000      # 预估持仓成本低于此值视为早期建仓阶段
+HIGHLIGHT_BUY_USD = 500.0        # 大单高亮
+EARLY_STAGE_MAX_COST = 2000      # 早期建仓判断阈值
 # ==================================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -42,7 +35,7 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-DB_PATH = "smart_money_bot_okx.db"
+DB_PATH = "smart_money_bot_gmgn.db"
 
 
 def init_db():
@@ -140,69 +133,69 @@ def get_db():
     return sqlite3.connect(DB_PATH)
 
 
-def get_okx_headers(method: str, request_path: str, body: str = "") -> dict:
-    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-    prehash = timestamp + method.upper() + request_path + body
-    signature = base64.b64encode(
-        hmac.new(
-            OKX_SECRET_KEY.encode('utf-8'),
-            prehash.encode('utf-8'),
-            hashlib.sha256
-        ).digest()
-    ).decode()
+# ==================== GMGN 数据获取 ====================
 
-    return {
-        "OK-ACCESS-KEY": OKX_API_KEY,
-        "OK-ACCESS-SIGN": signature,
-        "OK-ACCESS-TIMESTAMP": timestamp,
-        "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE,
-        "Content-Type": "application/json"
+async def gmgn_get(url: str, params: dict = None) -> dict:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
     }
-
-
-async def okx_get(path: str, params: dict = None) -> dict:
-    if params:
-        query = urlencode(params)
-        full_path = f"{path}?{query}"
-    else:
-        full_path = path
-
-    url = f"https://web3.okx.com{full_path}"
-    headers = get_okx_headers("GET", full_path)
+    if GMGN_API_KEY:
+        headers["Authorization"] = f"Bearer {GMGN_API_KEY}"
+        headers["x-route-key"] = GMGN_API_KEY
 
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(url, headers=headers, timeout=20) as resp:
-                data = await resp.json()
-                if data.get("code") != "0":
-                    logger.error(f"OKX API错误: {data}")
+            async with session.get(url, params=params, headers=headers, timeout=20) as resp:
+                if resp.status != 200:
+                    logger.warning(f"GMGN请求状态码: {resp.status} | {url}")
                     return {}
+                data = await resp.json()
                 return data
         except Exception as e:
-            logger.error(f"OKX请求异常: {e}")
+            logger.error(f"GMGN请求异常: {e}")
             return {}
 
 
-async def get_wallet_dex_history(wallet: str, begin_ts: int = None, trade_type: str = "1") -> List[dict]:
-    now = int(time.time() * 1000)
-    if begin_ts is None:
-        begin_ts = now - 24 * 3600 * 1000
-
+async def get_wallet_activity(wallet: str, limit: int = 50) -> List[dict]:
+    """获取钱包最近交易活动（GMGN）"""
+    # 优先使用公开接口
+    url = f"https://gmgn.ai/vas/api/v1/wallet_activity/sol"
     params = {
-        "chainIndex": CHAIN_INDEX,
-        "walletAddress": wallet,
-        "begin": str(begin_ts),
-        "end": str(now),
-        "type": trade_type,
-        "limit": "50"
+        "wallet": wallet,
+        "limit": limit,
+        "type": "buy"
     }
+    data = await gmgn_get(url, params)
 
-    data = await okx_get("/api/v6/dex/market/portfolio/dex-history", params)
     if not data:
-        return []
+        # 备用接口
+        url2 = f"https://gmgn.ai/defi/quotation/v1/wallet/{wallet}/activity"
+        data = await gmgn_get(url2, {"limit": limit})
 
-    result = data.get("data", {})
-    return result.get("transactionList", []) or []
+    # 兼容不同返回结构
+    if isinstance(data, dict):
+        activities = data.get("data", {}).get("activities") or data.get("data") or data.get("activities") or []
+        if isinstance(activities, dict):
+            activities = activities.get("list") or activities.get("activities") or []
+        return activities if isinstance(activities, list) else []
+    return []
+
+
+async def get_wallet_holdings(wallet: str) -> List[dict]:
+    """获取钱包当前持仓（用于辅助判断成本）"""
+    url = f"https://gmgn.ai/pf/api/v1/wallet/sol/{wallet}/holdings"
+    params = {"limit": 50}
+    data = await gmgn_get(url, params)
+
+    if not data:
+        url2 = f"https://gmgn.ai/defi/quotation/v1/smartmoney/sol/walletNew/{wallet}"
+        data = await gmgn_get(url2)
+
+    if isinstance(data, dict):
+        holdings = data.get("data", {}).get("holdings") or data.get("data", {}).get("tokens") or data.get("holdings") or []
+        return holdings if isinstance(holdings, list) else []
+    return []
 
 
 async def get_dexscreener_info(mint: str) -> Dict[str, Any]:
@@ -228,6 +221,8 @@ async def get_dexscreener_info(mint: str) -> Dict[str, Any]:
             logger.error(f"DexScreener 错误: {e}")
     return {}
 
+
+# ==================== 数据库辅助 ====================
 
 def update_daily_flow(wallet: str, mint: str, flow_date: str, buy_usd: float = 0, sell_usd: float = 0):
     conn = get_db()
@@ -255,29 +250,16 @@ def get_net_flow_stats(wallet: str, mint: str, days: int = 7) -> Dict[str, Any]:
     conn = get_db()
     c = conn.cursor()
     since_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
-
     c.execute("""
-        SELECT 
-            COALESCE(SUM(buy_usd), 0),
-            COALESCE(SUM(sell_usd), 0),
-            COALESCE(SUM(net_usd), 0),
-            COALESCE(SUM(buy_count), 0),
-            COALESCE(SUM(sell_count), 0)
-        FROM daily_flow
-        WHERE wallet=? AND mint=? AND flow_date >= ?
+        SELECT COALESCE(SUM(buy_usd), 0), COALESCE(SUM(sell_usd), 0),
+               COALESCE(SUM(net_usd), 0), COALESCE(SUM(buy_count), 0), COALESCE(SUM(sell_count), 0)
+        FROM daily_flow WHERE wallet=? AND mint=? AND flow_date >= ?
     """, (wallet, mint, since_date))
     row = c.fetchone()
     conn.close()
-
     buy_usd, sell_usd, net_usd, buy_count, sell_count = row or (0, 0, 0, 0, 0)
-    return {
-        "buy_usd": buy_usd,
-        "sell_usd": sell_usd,
-        "net_usd": net_usd,
-        "buy_count": buy_count,
-        "sell_count": sell_count,
-        "days": days
-    }
+    return {"buy_usd": buy_usd, "sell_usd": sell_usd, "net_usd": net_usd,
+            "buy_count": buy_count, "sell_count": sell_count, "days": days}
 
 
 def get_consecutive_net_buy_days(wallet: str, mint: str) -> int:
@@ -285,19 +267,14 @@ def get_consecutive_net_buy_days(wallet: str, mint: str) -> int:
     c = conn.cursor()
     c.execute("""
         SELECT flow_date, net_usd FROM daily_flow
-        WHERE wallet=? AND mint=?
-        ORDER BY flow_date DESC
-        LIMIT 30
+        WHERE wallet=? AND mint=? ORDER BY flow_date DESC LIMIT 30
     """, (wallet, mint))
     rows = c.fetchall()
     conn.close()
-
     if not rows:
         return 0
-
     consecutive = 0
     expected_date = datetime.now(timezone.utc).date()
-
     for flow_date_str, net_usd in rows:
         flow_date = datetime.strptime(flow_date_str, "%Y-%m-%d").date()
         if net_usd > 0 and flow_date == expected_date:
@@ -308,7 +285,6 @@ def get_consecutive_net_buy_days(wallet: str, mint: str) -> int:
             expected_date = flow_date - timedelta(days=1)
         else:
             break
-
     return consecutive
 
 
@@ -317,8 +293,7 @@ def get_buy_dates(wallet: str, mint: str) -> List[str]:
     c = conn.cursor()
     c.execute("""
         SELECT DISTINCT buy_date FROM buy_records
-        WHERE wallet=? AND mint=?
-        ORDER BY buy_date DESC
+        WHERE wallet=? AND mint=? ORDER BY buy_date DESC
     """, (wallet, mint))
     rows = c.fetchall()
     conn.close()
@@ -351,6 +326,8 @@ def get_cost_basis(wallet: str, mint: str) -> tuple:
     return 0, 0
 
 
+# ==================== 核心处理 ====================
+
 async def process_wallet(wallet: str):
     conn = get_db()
     c = conn.cursor()
@@ -359,76 +336,63 @@ async def process_wallet(wallet: str):
     last_checked = row[0] if row else 0
     conn.close()
 
-    begin_ts = last_checked * 1000 if last_checked > 0 else int(time.time() * 1000) - 12 * 3600 * 1000
-
-    buy_trades = await get_wallet_dex_history(wallet, begin_ts, trade_type="1")
-    sell_trades = await get_wallet_dex_history(wallet, begin_ts, trade_type="2")
+    activities = await get_wallet_activity(wallet, limit=50)
+    if not activities:
+        logger.info(f"钱包 {wallet[:8]}... 暂无新活动")
+        return
 
     newest_ts = last_checked
 
-    for trade in buy_trades:
+    for act in activities:
         try:
-            mint = trade.get("tokenContractAddress") or trade.get("tokenAddress")
+            # 兼容多种字段名
+            side = (act.get("event_type") or act.get("side") or act.get("type") or "").lower()
+            if side not in ("buy", "sell"):
+                continue
+
+            mint = (act.get("token_address") or act.get("token", {}).get("address") or
+                    act.get("mint") or act.get("token_address") or "")
             if not mint:
                 continue
 
-            tx_time = int(trade.get("time") or trade.get("txTime") or 0)
-            if tx_time <= last_checked * 1000:
+            # 时间
+            ts = act.get("timestamp") or act.get("block_timestamp") or act.get("time") or 0
+            if isinstance(ts, str):
+                try:
+                    ts = int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
+                except Exception:
+                    ts = 0
+            ts = int(ts)
+            if ts > 1e12:  # 毫秒转秒
+                ts = ts // 1000
+
+            if ts <= last_checked:
                 continue
 
-            amount = float(trade.get("amount") or 0)
-            price = float(trade.get("price") or 0)
-            value_usd = float(trade.get("valueUsd") or 0)
-            symbol = trade.get("tokenSymbol") or "UNKNOWN"
-            tx_sig = trade.get("txHash") or trade.get("signature") or ""
+            # 金额
+            value_usd = float(act.get("cost_usd") or act.get("amount_usd") or act.get("value_usd") or
+                              act.get("quote_amount") or 0)
+            token_amount = float(act.get("token_amount") or act.get("amount") or
+                                 act.get("token", {}).get("amount") or 0)
+            price_usd = float(act.get("price_usd") or act.get("token", {}).get("price_usd") or 0)
+            symbol = (act.get("token", {}).get("symbol") or act.get("symbol") or "UNKNOWN")
+            tx_sig = act.get("tx_hash") or act.get("signature") or act.get("transaction_hash") or ""
 
-            newest_ts = max(newest_ts, tx_time // 1000)
+            newest_ts = max(newest_ts, ts)
 
             await handle_trade(
                 wallet=wallet,
                 mint=mint,
-                side="buy",
-                token_amount=amount,
-                trade_ts=tx_time // 1000,
-                price_usd=price,
+                side=side,
+                token_amount=token_amount,
+                trade_ts=ts,
+                price_usd=price_usd,
                 value_usd=value_usd,
                 symbol=symbol,
                 tx_signature=tx_sig
             )
         except Exception as e:
-            logger.error(f"处理买入失败: {e}")
-
-    for trade in sell_trades:
-        try:
-            mint = trade.get("tokenContractAddress") or trade.get("tokenAddress")
-            if not mint:
-                continue
-
-            tx_time = int(trade.get("time") or trade.get("txTime") or 0)
-            if tx_time <= last_checked * 1000:
-                continue
-
-            amount = float(trade.get("amount") or 0)
-            price = float(trade.get("price") or 0)
-            value_usd = float(trade.get("valueUsd") or 0)
-            symbol = trade.get("tokenSymbol") or "UNKNOWN"
-            tx_sig = trade.get("txHash") or trade.get("signature") or ""
-
-            newest_ts = max(newest_ts, tx_time // 1000)
-
-            await handle_trade(
-                wallet=wallet,
-                mint=mint,
-                side="sell",
-                token_amount=amount,
-                trade_ts=tx_time // 1000,
-                price_usd=price,
-                value_usd=value_usd,
-                symbol=symbol,
-                tx_signature=tx_sig
-            )
-        except Exception as e:
-            logger.error(f"处理卖出失败: {e}")
+            logger.error(f"处理单条活动失败: {e}")
 
     if newest_ts > last_checked:
         conn = get_db()
@@ -503,7 +467,7 @@ async def handle_trade(wallet: str, mint: str, side: str, token_amount: float,
     conn.commit()
     conn.close()
 
-    # 只有单笔买入 ≥ MIN_BUY_USD 才进入通知判断
+    # 只有买入且金额达标才通知
     if side != "buy" or value_usd < MIN_BUY_USD:
         return
 
@@ -542,10 +506,7 @@ async def send_buy_alert(wallet: str, mint: str, token_amount: float, buy_ts: in
 
     pnl_usd = (current_price - avg_cost) * total_tokens if avg_cost > 0 else 0
     pnl_pct = ((current_price / avg_cost) - 1) * 100 if avg_cost > 0 else 0
-    if pnl_usd >= 0:
-        pnl_text = f"+${pnl_usd:,.2f} (+{pnl_pct:.2f}%)"
-    else:
-        pnl_text = f"-${abs(pnl_usd):,.2f} ({pnl_pct:.2f}%)"
+    pnl_text = f"+${pnl_usd:,.2f} (+{pnl_pct:.2f}%)" if pnl_usd >= 0 else f"-${abs(pnl_usd):,.2f} ({pnl_pct:.2f}%)"
 
     buy_dates = get_buy_dates(wallet, mint)
     times = len(buy_dates)
@@ -561,7 +522,7 @@ async def send_buy_alert(wallet: str, mint: str, token_amount: float, buy_ts: in
 
     short_wallet = wallet[:6] + "..." + wallet[-4:]
 
-    # ========== 信号等级判断（核心） ==========
+    # 信号等级
     is_consecutive = consecutive_buy_days >= 2
     is_net_inflow = consecutive_net_days >= 2 and flow_3d["net_usd"] > 0
     is_large_buy = value_usd >= HIGHLIGHT_BUY_USD
@@ -597,14 +558,10 @@ async def send_buy_alert(wallet: str, mint: str, token_amount: float, buy_ts: in
     elif flow_1d["net_usd"] < 0:
         net_info = f" | 今日净流出${flow_1d['net_usd']:,.0f}"
 
-    stage_info = ""
-    if is_early_stage:
-        stage_info = f" | 预估持仓成本 ${total_cost:,.0f}（早期）"
-    else:
-        stage_info = f" | 预估持仓成本 ${total_cost:,.0f}"
+    stage_info = f" | 预估持仓成本 ${total_cost:,.0f}" + ("（早期）" if is_early_stage else "")
 
     text = (
-        f"{level_emoji} <b>聪明钱加仓提醒</b>\n"
+        f"{level_emoji} <b>聪明钱加仓提醒</b>（GMGN）\n"
         f"<b>{level}</b>\n\n"
         f"<b>这是第 {times} 次买入该代币（连续 {consecutive_buy_days} 天加仓）{net_info}</b>\n"
         f"<b>{stage_info}</b>\n\n"
@@ -648,13 +605,13 @@ def format_age(seconds: int) -> str:
     return f"{seconds // 86400}天"
 
 
-# ------------------ 命令 ------------------
+# ==================== 命令 ====================
 
 @router.message(Command("start"), F.from_user.id == ADMIN_ID)
 @router.message(Command("help"), F.from_user.id == ADMIN_ID)
 async def cmd_help(message: Message):
     await message.answer(
-        "聪明钱跟踪 Bot（早期信号版 v2）\n\n"
+        "聪明钱跟踪 Bot（GMGN 早期信号版）\n\n"
         "/follow 钱包地址 - 开始跟踪\n"
         "/unfollow 钱包地址 - 取消跟踪\n"
         "/follows - 查看跟踪列表\n"
@@ -809,7 +766,7 @@ async def cmd_status(message: Message):
     sell_count = c.fetchone()[0]
     conn.close()
     await message.answer(
-        f"运行正常（早期信号版 v2）\n"
+        f"运行正常（GMGN 早期信号版）\n"
         f"跟踪地址数: {wallet_count}\n"
         f"累计通知次数: {notify_count}\n"
         f"买入记录: {buy_count} | 卖出记录: {sell_count}\n"
@@ -828,7 +785,7 @@ async def polling_loop():
             conn.close()
             for wallet in wallets:
                 await process_wallet(wallet)
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
         except Exception as e:
             logger.error(f"轮询错误: {e}")
         await asyncio.sleep(POLL_INTERVAL)
@@ -838,12 +795,9 @@ async def main():
     if not TELEGRAM_BOT_TOKEN or ADMIN_ID == 0:
         logger.error("请检查 TELEGRAM_BOT_TOKEN / ADMIN_ID")
         return
-    if not OKX_API_KEY or not OKX_SECRET_KEY or not OKX_PASSPHRASE:
-        logger.error("请检查 OKX_API_KEY / OKX_SECRET_KEY / OKX_PASSPHRASE")
-        return
 
     init_db()
-    logger.info("Bot 启动中（早期信号版 v2）...")
+    logger.info("Bot 启动中（GMGN 早期信号版）...")
     asyncio.create_task(polling_loop())
     await dp.start_polling(bot)
 
