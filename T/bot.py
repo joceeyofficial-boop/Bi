@@ -7,7 +7,7 @@ import hmac
 import hashlib
 import base64
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 from urllib.parse import urlencode
 
 import aiohttp
@@ -26,11 +26,12 @@ OKX_API_KEY = os.getenv("OKX_API_KEY", "")
 OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY", "")
 OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
 
-# Solana chainIndex
 CHAIN_INDEX = "501"
 
-POLL_INTERVAL = 180          # 3分钟检查一次
-MIN_BUY_USD = 300.0          # 单笔买入低于此金额不报警
+POLL_INTERVAL = 180
+MIN_BUY_USD = 300.0              # 单笔低于此金额不通知
+HIGHLIGHT_BUY_USD = 500.0        # 单笔较大时额外高亮
+EARLY_STAGE_MAX_COST = 2000      # 预估持仓成本低于此值视为早期建仓阶段
 # ==================================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -183,7 +184,6 @@ async def okx_get(path: str, params: dict = None) -> dict:
 
 
 async def get_wallet_dex_history(wallet: str, begin_ts: int = None, trade_type: str = "1") -> List[dict]:
-    """trade_type: "1" = BUY, "2" = SELL"""
     now = int(time.time() * 1000)
     if begin_ts is None:
         begin_ts = now - 24 * 3600 * 1000
@@ -340,6 +340,17 @@ def calculate_consecutive_buy_days(buy_dates: List[str]) -> int:
     return consecutive
 
 
+def get_cost_basis(wallet: str, mint: str) -> tuple:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT total_tokens, total_cost_usd FROM cost_basis WHERE wallet=? AND mint=?", (wallet, mint))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return row[0] or 0, row[1] or 0
+    return 0, 0
+
+
 async def process_wallet(wallet: str):
     conn = get_db()
     c = conn.cursor()
@@ -492,10 +503,11 @@ async def handle_trade(wallet: str, mint: str, side: str, token_amount: float,
     conn.commit()
     conn.close()
 
-    # 只有单笔买入 ≥ MIN_BUY_USD 才通知
+    # 只有单笔买入 ≥ MIN_BUY_USD 才进入通知判断
     if side != "buy" or value_usd < MIN_BUY_USD:
         return
 
+    # 同一天同一币只通知一次
     conn = get_db()
     c = conn.cursor()
     c.execute(
@@ -525,14 +537,8 @@ async def send_buy_alert(wallet: str, mint: str, token_amount: float, buy_ts: in
     market_cap = info.get("market_cap", 0) if info else 0
     launch_ts = info.get("launch_ts") if info else None
 
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT total_tokens, total_cost_usd FROM cost_basis WHERE wallet=? AND mint=?", (wallet, mint))
-    row = c.fetchone()
-    total_tokens = row[0] if row else 0
-    total_cost = row[1] if row else 0
+    total_tokens, total_cost = get_cost_basis(wallet, mint)
     avg_cost = (total_cost / total_tokens) if total_tokens > 0 else price_usd
-    conn.close()
 
     pnl_usd = (current_price - avg_cost) * total_tokens if avg_cost > 0 else 0
     pnl_pct = ((current_price / avg_cost) - 1) * 100 if avg_cost > 0 else 0
@@ -555,20 +561,56 @@ async def send_buy_alert(wallet: str, mint: str, token_amount: float, buy_ts: in
 
     short_wallet = wallet[:6] + "..." + wallet[-4:]
 
-    # 净流入状态文案
-    net_status = ""
-    if consecutive_net_days >= 3 and flow_3d["net_usd"] > 0:
-        net_status = f" | 净流入连续{consecutive_net_days}天"
+    # ========== 信号等级判断（核心） ==========
+    is_consecutive = consecutive_buy_days >= 2
+    is_net_inflow = consecutive_net_days >= 2 and flow_3d["net_usd"] > 0
+    is_large_buy = value_usd >= HIGHLIGHT_BUY_USD
+    is_early_stage = total_cost <= EARLY_STAGE_MAX_COST
+
+    if is_consecutive and is_net_inflow and is_early_stage:
+        level = "🔥 早期连续建仓"
+        level_emoji = "🔥"
+    elif is_consecutive and is_early_stage:
+        level = "🟡 连续加仓（早期）"
+        level_emoji = "🟡"
+    elif is_consecutive and is_net_inflow:
+        level = "🟢 连续加仓 + 净流入"
+        level_emoji = "🟢"
+    elif is_consecutive:
+        level = "🟢 连续加仓"
+        level_emoji = "🟢"
+    elif is_large_buy and is_early_stage:
+        level = "🟡 大单买入（早期）"
+        level_emoji = "🟡"
+    elif is_large_buy:
+        level = "⚪ 大单买入"
+        level_emoji = "⚪"
+    else:
+        level = "⚪ 普通加仓"
+        level_emoji = "⚪"
+
+    net_info = ""
+    if consecutive_net_days >= 2:
+        net_info = f" | 净流入连续{consecutive_net_days}天"
     elif flow_1d["net_usd"] > 0:
-        net_status = f" | 今日净流入${flow_1d['net_usd']:+,.0f}"
+        net_info = f" | 今日净流入${flow_1d['net_usd']:+,.0f}"
     elif flow_1d["net_usd"] < 0:
-        net_status = f" | 今日净流出${flow_1d['net_usd']:,.0f}"
+        net_info = f" | 今日净流出${flow_1d['net_usd']:,.0f}"
+
+    stage_info = ""
+    if is_early_stage:
+        stage_info = f" | 预估持仓成本 ${total_cost:,.0f}（早期）"
+    else:
+        stage_info = f" | 预估持仓成本 ${total_cost:,.0f}"
 
     text = (
-        f"🔔 <b>聪明钱加仓提醒</b>\n\n"
-        f"<b>这是第 {times} 次买入该代币（连续 {consecutive_buy_days} 天加仓）{net_status}</b>\n\n"
+        f"{level_emoji} <b>聪明钱加仓提醒</b>\n"
+        f"<b>{level}</b>\n\n"
+        f"<b>这是第 {times} 次买入该代币（连续 {consecutive_buy_days} 天加仓）{net_info}</b>\n"
+        f"<b>{stage_info}</b>\n\n"
         f"钱包: <code>{short_wallet}</code>\n"
         f"代币: {name} (${symbol})\n\n"
+        f"本次买入: <b>${value_usd:,.2f}</b>\n"
         f"当前价格: ${current_price:.8f}\n"
         f"平均成本（跟踪后）: <b>${avg_cost:.8f}</b>\n"
         f"总盈亏: <b>{pnl_text}</b>\n"
@@ -581,7 +623,7 @@ async def send_buy_alert(wallet: str, mint: str, token_amount: float, buy_ts: in
 
     try:
         await bot.send_message(ADMIN_ID, text, parse_mode="HTML")
-        logger.info(f"通知成功: ${symbol} 第{times}次 | 连续{consecutive_buy_days}天")
+        logger.info(f"通知成功: ${symbol} | {level} | 第{times}次 | 连续{consecutive_buy_days}天")
     except Exception as e:
         logger.error(f"发送通知失败: {e}")
 
@@ -612,7 +654,7 @@ def format_age(seconds: int) -> str:
 @router.message(Command("help"), F.from_user.id == ADMIN_ID)
 async def cmd_help(message: Message):
     await message.answer(
-        "聪明钱跟踪 Bot（优化版 v2）\n\n"
+        "聪明钱跟踪 Bot（早期信号版 v2）\n\n"
         "/follow 钱包地址 - 开始跟踪\n"
         "/unfollow 钱包地址 - 取消跟踪\n"
         "/follows - 查看跟踪列表\n"
@@ -621,7 +663,9 @@ async def cmd_help(message: Message):
         "/flow 钱包地址 代币mint - 查看净流入详情\n"
         "/status - 运行状态\n"
         "/help - 帮助\n\n"
-        f"当前设置：单笔买入 ≥ ${MIN_BUY_USD:.0f} 才通知"
+        f"通知门槛: 单笔 ≥ ${MIN_BUY_USD:.0f}\n"
+        f"高亮大单: ≥ ${HIGHLIGHT_BUY_USD:.0f}\n"
+        f"早期判断: 持仓成本 ≤ ${EARLY_STAGE_MAX_COST:,.0f}"
     )
 
 
@@ -711,9 +755,10 @@ async def cmd_list(message: Message):
     for i, (mint, symbol, count, total_tokens, total_cost) in enumerate(rows, 1):
         symbol = symbol or "UNKNOWN"
         avg_cost = (total_cost / total_tokens) if total_tokens and total_tokens > 0 else 0
+        cost_str = f"${total_cost:,.0f}" if total_cost else "0"
         text += (
             f"{i}. <b>${symbol}</b>\n"
-            f"报警: {count}次 | 平均成本: ${avg_cost:.8f}\n\n"
+            f"报警: {count}次 | 成本: {cost_str} | 均价: ${avg_cost:.8f}\n\n"
         )
     await message.answer(text, parse_mode="HTML")
 
@@ -733,11 +778,13 @@ async def cmd_flow(message: Message, command: CommandObject):
     flow_3d = get_net_flow_stats(wallet, mint, 3)
     flow_7d = get_net_flow_stats(wallet, mint, 7)
     consecutive = get_consecutive_net_buy_days(wallet, mint)
+    total_tokens, total_cost = get_cost_basis(wallet, mint)
 
     text = (
         f"📊 <b>净流入详情</b>\n\n"
         f"钱包: <code>{wallet[:6]}...{wallet[-4:]}</code>\n"
         f"代币: <code>{mint[:10]}...</code>\n\n"
+        f"预估持仓成本: <b>${total_cost:,.0f}</b>\n\n"
         f"今日净流入: <b>${flow_1d['net_usd']:+,.2f}</b>\n"
         f"  买入 {flow_1d['buy_count']} 笔 / ${flow_1d['buy_usd']:,.0f}\n"
         f"  卖出 {flow_1d['sell_count']} 笔 / ${flow_1d['sell_usd']:,.0f}\n\n"
@@ -762,11 +809,12 @@ async def cmd_status(message: Message):
     sell_count = c.fetchone()[0]
     conn.close()
     await message.answer(
-        f"运行正常（优化版 v2）\n"
+        f"运行正常（早期信号版 v2）\n"
         f"跟踪地址数: {wallet_count}\n"
         f"累计通知次数: {notify_count}\n"
         f"买入记录: {buy_count} | 卖出记录: {sell_count}\n"
-        f"单笔通知阈值: ≥ ${MIN_BUY_USD:.0f}"
+        f"单笔通知阈值: ≥ ${MIN_BUY_USD:.0f}\n"
+        f"早期成本阈值: ≤ ${EARLY_STAGE_MAX_COST:,.0f}"
     )
 
 
@@ -795,7 +843,7 @@ async def main():
         return
 
     init_db()
-    logger.info("Bot 启动中（优化版 v2 + 净流入）...")
+    logger.info("Bot 启动中（早期信号版 v2）...")
     asyncio.create_task(polling_loop())
     await dp.start_polling(bot)
 
