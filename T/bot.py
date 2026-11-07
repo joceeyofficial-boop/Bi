@@ -46,7 +46,9 @@ DB_PATH = "smart_money_bot_okx.db"
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
     c = conn.cursor()
 
     c.execute("""
@@ -137,7 +139,10 @@ def init_db():
 
 
 def get_db():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    return conn
 
 
 def get_okx_headers(method: str, request_path: str, body: str = "") -> dict:
@@ -472,6 +477,14 @@ async def handle_trade(wallet: str, mint: str, side: str, token_amount: float,
                 total_cost_usd = total_cost_usd + excluded.total_cost_usd
         """, (wallet, mint, token_amount, value_usd))
 
+        # 先提交主事务，再更新 daily_flow（避免嵌套连接导致锁）
+        c.execute(
+            "INSERT OR IGNORE INTO token_info (mint, symbol, name, launch_ts) VALUES (?, ?, ?, 0)",
+            (mint, symbol, symbol)
+        )
+        conn.commit()
+        conn.close()
+
         update_daily_flow(wallet, mint, trade_date, buy_usd=value_usd, sell_usd=0)
 
     else:
@@ -494,14 +507,15 @@ async def handle_trade(wallet: str, mint: str, side: str, token_amount: float,
             WHERE wallet=? AND mint=?
         """, (token_amount, token_amount, wallet, mint))
 
-        update_daily_flow(wallet, mint, trade_date, buy_usd=0, sell_usd=value_usd)
+        # 先提交主事务，再更新 daily_flow（避免嵌套连接导致锁）
+        c.execute(
+            "INSERT OR IGNORE INTO token_info (mint, symbol, name, launch_ts) VALUES (?, ?, ?, 0)",
+            (mint, symbol, symbol)
+        )
+        conn.commit()
+        conn.close()
 
-    c.execute(
-        "INSERT OR IGNORE INTO token_info (mint, symbol, name, launch_ts) VALUES (?, ?, ?, 0)",
-        (mint, symbol, symbol)
-    )
-    conn.commit()
-    conn.close()
+        update_daily_flow(wallet, mint, trade_date, buy_usd=0, sell_usd=value_usd)
 
     # 只有单笔买入 ≥ MIN_BUY_USD 才进入通知判断
     if side != "buy" or value_usd < MIN_BUY_USD:
