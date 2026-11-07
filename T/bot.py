@@ -7,7 +7,7 @@ import hmac
 import hashlib
 import base64
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import aiohttp
@@ -29,7 +29,8 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
 # Solana chainIndex
 CHAIN_INDEX = "501"
 
-POLL_INTERVAL = 180          # 3分钟检查一次，控制免费额度消耗
+POLL_INTERVAL = 180          # 3分钟检查一次
+MIN_BUY_USD = 300.0          # 单笔买入低于此金额不报警
 # ==================================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -46,6 +47,7 @@ DB_PATH = "smart_money_bot_okx.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS tracked_wallets (
             address TEXT PRIMARY KEY,
@@ -54,6 +56,37 @@ def init_db():
             status TEXT DEFAULT 'normal'
         )
     """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS buy_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT,
+            mint TEXT,
+            buy_date TEXT,
+            buy_ts INTEGER,
+            token_amount REAL,
+            value_usd REAL,
+            price_usd REAL,
+            tx_signature TEXT,
+            UNIQUE(wallet, mint, buy_ts, token_amount)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sell_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT,
+            mint TEXT,
+            sell_date TEXT,
+            sell_ts INTEGER,
+            token_amount REAL,
+            value_usd REAL,
+            price_usd REAL,
+            tx_signature TEXT,
+            UNIQUE(wallet, mint, sell_ts, token_amount)
+        )
+    """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS notified (
             wallet TEXT,
@@ -64,6 +97,7 @@ def init_db():
             PRIMARY KEY (wallet, mint, buy_date)
         )
     """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS cost_basis (
             wallet TEXT,
@@ -73,6 +107,7 @@ def init_db():
             PRIMARY KEY (wallet, mint)
         )
     """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS token_info (
             mint TEXT PRIMARY KEY,
@@ -81,6 +116,21 @@ def init_db():
             launch_ts INTEGER
         )
     """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS daily_flow (
+            wallet TEXT,
+            mint TEXT,
+            flow_date TEXT,
+            buy_usd REAL DEFAULT 0,
+            sell_usd REAL DEFAULT 0,
+            net_usd REAL DEFAULT 0,
+            buy_count INTEGER DEFAULT 0,
+            sell_count INTEGER DEFAULT 0,
+            PRIMARY KEY (wallet, mint, flow_date)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -90,7 +140,6 @@ def get_db():
 
 
 def get_okx_headers(method: str, request_path: str, body: str = "") -> dict:
-    """生成 OKX API 签名头"""
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
     prehash = timestamp + method.upper() + request_path + body
     signature = base64.b64encode(
@@ -111,7 +160,6 @@ def get_okx_headers(method: str, request_path: str, body: str = "") -> dict:
 
 
 async def okx_get(path: str, params: dict = None) -> dict:
-    """发送 OKX GET 请求"""
     if params:
         query = urlencode(params)
         full_path = f"{path}?{query}"
@@ -134,18 +182,18 @@ async def okx_get(path: str, params: dict = None) -> dict:
             return {}
 
 
-async def get_wallet_dex_history(wallet: str, begin_ts: int = None) -> List[dict]:
-    """获取钱包最近的 DEX 交易历史（买入优先）"""
+async def get_wallet_dex_history(wallet: str, begin_ts: int = None, trade_type: str = "1") -> List[dict]:
+    """trade_type: "1" = BUY, "2" = SELL"""
     now = int(time.time() * 1000)
     if begin_ts is None:
-        begin_ts = now - 24 * 3600 * 1000  # 默认查最近24小时
+        begin_ts = now - 24 * 3600 * 1000
 
     params = {
         "chainIndex": CHAIN_INDEX,
         "walletAddress": wallet,
         "begin": str(begin_ts),
         "end": str(now),
-        "type": "1",          # 1 = BUY
+        "type": trade_type,
         "limit": "50"
     }
 
@@ -155,12 +203,6 @@ async def get_wallet_dex_history(wallet: str, begin_ts: int = None) -> List[dict
 
     result = data.get("data", {})
     return result.get("transactionList", []) or []
-
-
-async def get_token_pnl(wallet: str, mint: str) -> dict:
-    """获取该钱包对某个代币的最新盈亏信息（可选）"""
-    # 这里可以调用 recent-pnl 或 token latest-pnl，先简化处理
-    return {}
 
 
 async def get_dexscreener_info(mint: str) -> Dict[str, Any]:
@@ -187,19 +229,103 @@ async def get_dexscreener_info(mint: str) -> Dict[str, Any]:
     return {}
 
 
+def update_daily_flow(wallet: str, mint: str, flow_date: str, buy_usd: float = 0, sell_usd: float = 0):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO daily_flow (wallet, mint, flow_date, buy_usd, sell_usd, net_usd, buy_count, sell_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(wallet, mint, flow_date) DO UPDATE SET
+            buy_usd = buy_usd + excluded.buy_usd,
+            sell_usd = sell_usd + excluded.sell_usd,
+            net_usd = (buy_usd + excluded.buy_usd) - (sell_usd + excluded.sell_usd),
+            buy_count = buy_count + excluded.buy_count,
+            sell_count = sell_count + excluded.sell_count
+    """, (
+        wallet, mint, flow_date,
+        buy_usd, sell_usd, buy_usd - sell_usd,
+        1 if buy_usd > 0 else 0,
+        1 if sell_usd > 0 else 0
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_net_flow_stats(wallet: str, mint: str, days: int = 7) -> Dict[str, Any]:
+    conn = get_db()
+    c = conn.cursor()
+    since_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    c.execute("""
+        SELECT 
+            COALESCE(SUM(buy_usd), 0),
+            COALESCE(SUM(sell_usd), 0),
+            COALESCE(SUM(net_usd), 0),
+            COALESCE(SUM(buy_count), 0),
+            COALESCE(SUM(sell_count), 0)
+        FROM daily_flow
+        WHERE wallet=? AND mint=? AND flow_date >= ?
+    """, (wallet, mint, since_date))
+    row = c.fetchone()
+    conn.close()
+
+    buy_usd, sell_usd, net_usd, buy_count, sell_count = row or (0, 0, 0, 0, 0)
+    return {
+        "buy_usd": buy_usd,
+        "sell_usd": sell_usd,
+        "net_usd": net_usd,
+        "buy_count": buy_count,
+        "sell_count": sell_count,
+        "days": days
+    }
+
+
+def get_consecutive_net_buy_days(wallet: str, mint: str) -> int:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""
+        SELECT flow_date, net_usd FROM daily_flow
+        WHERE wallet=? AND mint=?
+        ORDER BY flow_date DESC
+        LIMIT 30
+    """, (wallet, mint))
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        return 0
+
+    consecutive = 0
+    expected_date = datetime.now(timezone.utc).date()
+
+    for flow_date_str, net_usd in rows:
+        flow_date = datetime.strptime(flow_date_str, "%Y-%m-%d").date()
+        if net_usd > 0 and flow_date == expected_date:
+            consecutive += 1
+            expected_date -= timedelta(days=1)
+        elif net_usd > 0 and (expected_date - flow_date).days == 1:
+            consecutive += 1
+            expected_date = flow_date - timedelta(days=1)
+        else:
+            break
+
+    return consecutive
+
+
 def get_buy_dates(wallet: str, mint: str) -> List[str]:
     conn = get_db()
     c = conn.cursor()
-    c.execute(
-        "SELECT buy_date FROM notified WHERE wallet=? AND mint=? ORDER BY buy_date",
-        (wallet, mint)
-    )
+    c.execute("""
+        SELECT DISTINCT buy_date FROM buy_records
+        WHERE wallet=? AND mint=?
+        ORDER BY buy_date DESC
+    """, (wallet, mint))
     rows = c.fetchall()
     conn.close()
     return [r[0] for r in rows]
 
 
-def calculate_consecutive_days(buy_dates: List[str]) -> int:
+def calculate_consecutive_buy_days(buy_dates: List[str]) -> int:
     if not buy_dates:
         return 0
     dates = sorted(set(buy_dates), reverse=True)
@@ -214,7 +340,7 @@ def calculate_consecutive_days(buy_dates: List[str]) -> int:
     return consecutive
 
 
-async def process_new_buys(wallet: str):
+async def process_wallet(wallet: str):
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT last_checked FROM tracked_wallets WHERE address = ?", (wallet,))
@@ -222,20 +348,15 @@ async def process_new_buys(wallet: str):
     last_checked = row[0] if row else 0
     conn.close()
 
-    # 从上次检查时间开始查（毫秒）
-    begin_ts = last_checked * 1000 if last_checked > 0 else int(time.time() * 1000) - 6 * 3600 * 1000
+    begin_ts = last_checked * 1000 if last_checked > 0 else int(time.time() * 1000) - 12 * 3600 * 1000
 
-    trades = await get_wallet_dex_history(wallet, begin_ts)
-    if not trades:
-        return
-
-    logger.info(f"钱包 {wallet[:8]}... 发现 {len(trades)} 笔买入记录")
+    buy_trades = await get_wallet_dex_history(wallet, begin_ts, trade_type="1")
+    sell_trades = await get_wallet_dex_history(wallet, begin_ts, trade_type="2")
 
     newest_ts = last_checked
 
-    for trade in trades:
+    for trade in buy_trades:
         try:
-            # OKX 返回字段可能因版本略有差异，做兼容处理
             mint = trade.get("tokenContractAddress") or trade.get("tokenAddress")
             if not mint:
                 continue
@@ -248,23 +369,56 @@ async def process_new_buys(wallet: str):
             price = float(trade.get("price") or 0)
             value_usd = float(trade.get("valueUsd") or 0)
             symbol = trade.get("tokenSymbol") or "UNKNOWN"
+            tx_sig = trade.get("txHash") or trade.get("signature") or ""
 
-            # 更新最新时间
             newest_ts = max(newest_ts, tx_time // 1000)
 
-            await handle_buy(
+            await handle_trade(
                 wallet=wallet,
                 mint=mint,
+                side="buy",
                 token_amount=amount,
-                buy_ts=tx_time // 1000,
+                trade_ts=tx_time // 1000,
                 price_usd=price,
                 value_usd=value_usd,
-                symbol=symbol
+                symbol=symbol,
+                tx_signature=tx_sig
             )
         except Exception as e:
-            logger.error(f"处理单笔交易失败: {e}")
+            logger.error(f"处理买入失败: {e}")
 
-    # 更新 last_checked
+    for trade in sell_trades:
+        try:
+            mint = trade.get("tokenContractAddress") or trade.get("tokenAddress")
+            if not mint:
+                continue
+
+            tx_time = int(trade.get("time") or trade.get("txTime") or 0)
+            if tx_time <= last_checked * 1000:
+                continue
+
+            amount = float(trade.get("amount") or 0)
+            price = float(trade.get("price") or 0)
+            value_usd = float(trade.get("valueUsd") or 0)
+            symbol = trade.get("tokenSymbol") or "UNKNOWN"
+            tx_sig = trade.get("txHash") or trade.get("signature") or ""
+
+            newest_ts = max(newest_ts, tx_time // 1000)
+
+            await handle_trade(
+                wallet=wallet,
+                mint=mint,
+                side="sell",
+                token_amount=amount,
+                trade_ts=tx_time // 1000,
+                price_usd=price,
+                value_usd=value_usd,
+                symbol=symbol,
+                tx_signature=tx_sig
+            )
+        except Exception as e:
+            logger.error(f"处理卖出失败: {e}")
+
     if newest_ts > last_checked:
         conn = get_db()
         c = conn.cursor()
@@ -276,63 +430,103 @@ async def process_new_buys(wallet: str):
         conn.close()
 
 
-async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int,
-                     price_usd: float = 0, value_usd: float = 0, symbol: str = "UNKNOWN"):
-    buy_date = datetime.fromtimestamp(buy_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+async def handle_trade(wallet: str, mint: str, side: str, token_amount: float,
+                       trade_ts: int, price_usd: float = 0, value_usd: float = 0,
+                       symbol: str = "UNKNOWN", tx_signature: str = ""):
+    trade_date = datetime.fromtimestamp(trade_ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
-    # 同一天只通知一次
+    if not price_usd and value_usd and token_amount > 0:
+        price_usd = value_usd / token_amount
+    if not value_usd and price_usd and token_amount > 0:
+        value_usd = token_amount * price_usd
+
+    conn = get_db()
+    c = conn.cursor()
+
+    if side == "buy":
+        try:
+            c.execute("""
+                INSERT OR IGNORE INTO buy_records
+                (wallet, mint, buy_date, buy_ts, token_amount, value_usd, price_usd, tx_signature)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (wallet, mint, trade_date, trade_ts, token_amount, value_usd, price_usd, tx_signature))
+        except Exception:
+            pass
+
+        c.execute("""
+            INSERT INTO cost_basis (wallet, mint, total_tokens, total_cost_usd)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(wallet, mint) DO UPDATE SET
+                total_tokens = total_tokens + excluded.total_tokens,
+                total_cost_usd = total_cost_usd + excluded.total_cost_usd
+        """, (wallet, mint, token_amount, value_usd))
+
+        update_daily_flow(wallet, mint, trade_date, buy_usd=value_usd, sell_usd=0)
+
+    else:
+        try:
+            c.execute("""
+                INSERT OR IGNORE INTO sell_records
+                (wallet, mint, sell_date, sell_ts, token_amount, value_usd, price_usd, tx_signature)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (wallet, mint, trade_date, trade_ts, token_amount, value_usd, price_usd, tx_signature))
+        except Exception:
+            pass
+
+        c.execute("""
+            UPDATE cost_basis SET
+                total_tokens = MAX(0, total_tokens - ?),
+                total_cost_usd = CASE
+                    WHEN total_tokens > 0 THEN total_cost_usd * (1 - ? / total_tokens)
+                    ELSE 0
+                END
+            WHERE wallet=? AND mint=?
+        """, (token_amount, token_amount, wallet, mint))
+
+        update_daily_flow(wallet, mint, trade_date, buy_usd=0, sell_usd=value_usd)
+
+    c.execute(
+        "INSERT OR IGNORE INTO token_info (mint, symbol, name, launch_ts) VALUES (?, ?, ?, 0)",
+        (mint, symbol, symbol)
+    )
+    conn.commit()
+    conn.close()
+
+    # 只有单笔买入 ≥ MIN_BUY_USD 才通知
+    if side != "buy" or value_usd < MIN_BUY_USD:
+        return
+
     conn = get_db()
     c = conn.cursor()
     c.execute(
         "SELECT 1 FROM notified WHERE wallet=? AND mint=? AND buy_date=?",
-        (wallet, mint, buy_date)
+        (wallet, mint, trade_date)
     )
     if c.fetchone():
         conn.close()
         return
 
-    # 补充 DexScreener 信息
-    info = await get_dexscreener_info(mint)
-    if info:
-        name = info.get("name", symbol)
-        if not price_usd:
-            price_usd = info.get("price_usd", 0)
-        liquidity = info.get("liquidity", 0)
-        market_cap = info.get("market_cap", 0)
-        launch_ts = info.get("launch_ts")
-    else:
-        name = symbol
-        liquidity = 0
-        market_cap = 0
-        launch_ts = None
-
-    if not price_usd and value_usd and token_amount > 0:
-        price_usd = value_usd / token_amount
-
-    cost_this_buy = token_amount * price_usd if price_usd else value_usd
-
-    c.execute("""
-        INSERT INTO cost_basis (wallet, mint, total_tokens, total_cost_usd)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(wallet, mint) DO UPDATE SET
-            total_tokens = total_tokens + excluded.total_tokens,
-            total_cost_usd = total_cost_usd + excluded.total_cost_usd
-    """, (wallet, mint, token_amount, cost_this_buy))
-
     c.execute(
         "INSERT INTO notified (wallet, mint, buy_date, notified_at, tx_signature) VALUES (?, ?, ?, ?, ?)",
-        (wallet, mint, buy_date, int(time.time()), "")
-    )
-    c.execute(
-        "INSERT OR REPLACE INTO token_info (mint, symbol, name, launch_ts) VALUES (?, ?, ?, ?)",
-        (mint, symbol, name, launch_ts or 0)
+        (wallet, mint, trade_date, int(time.time()), tx_signature)
     )
     conn.commit()
+    conn.close()
 
-    buy_dates = get_buy_dates(wallet, mint)
-    times = len(buy_dates)
-    consecutive = calculate_consecutive_days(buy_dates)
+    await send_buy_alert(wallet, mint, token_amount, trade_ts, price_usd, value_usd, symbol)
 
+
+async def send_buy_alert(wallet: str, mint: str, token_amount: float, buy_ts: int,
+                         price_usd: float, value_usd: float, symbol: str):
+    info = await get_dexscreener_info(mint)
+    name = info.get("name", symbol) if info else symbol
+    current_price = info.get("price_usd", price_usd) if info else price_usd
+    liquidity = info.get("liquidity", 0) if info else 0
+    market_cap = info.get("market_cap", 0) if info else 0
+    launch_ts = info.get("launch_ts") if info else None
+
+    conn = get_db()
+    c = conn.cursor()
     c.execute("SELECT total_tokens, total_cost_usd FROM cost_basis WHERE wallet=? AND mint=?", (wallet, mint))
     row = c.fetchone()
     total_tokens = row[0] if row else 0
@@ -340,15 +534,20 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int,
     avg_cost = (total_cost / total_tokens) if total_tokens > 0 else price_usd
     conn.close()
 
-    # 简单计算未实现盈亏（用当前价格）
-    current_price = info.get("price_usd", price_usd) if info else price_usd
     pnl_usd = (current_price - avg_cost) * total_tokens if avg_cost > 0 else 0
     pnl_pct = ((current_price / avg_cost) - 1) * 100 if avg_cost > 0 else 0
-
     if pnl_usd >= 0:
         pnl_text = f"+${pnl_usd:,.2f} (+{pnl_pct:.2f}%)"
     else:
         pnl_text = f"-${abs(pnl_usd):,.2f} ({pnl_pct:.2f}%)"
+
+    buy_dates = get_buy_dates(wallet, mint)
+    times = len(buy_dates)
+    consecutive_buy_days = calculate_consecutive_buy_days(buy_dates)
+    consecutive_net_days = get_consecutive_net_buy_days(wallet, mint)
+
+    flow_1d = get_net_flow_stats(wallet, mint, days=1)
+    flow_3d = get_net_flow_stats(wallet, mint, days=3)
 
     age_str = "未知"
     if launch_ts and launch_ts > 1600000000:
@@ -356,9 +555,18 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int,
 
     short_wallet = wallet[:6] + "..." + wallet[-4:]
 
+    # 净流入状态文案
+    net_status = ""
+    if consecutive_net_days >= 3 and flow_3d["net_usd"] > 0:
+        net_status = f" | 净流入连续{consecutive_net_days}天"
+    elif flow_1d["net_usd"] > 0:
+        net_status = f" | 今日净流入${flow_1d['net_usd']:+,.0f}"
+    elif flow_1d["net_usd"] < 0:
+        net_status = f" | 今日净流出${flow_1d['net_usd']:,.0f}"
+
     text = (
         f"🔔 <b>聪明钱加仓提醒</b>\n\n"
-        f"<b>这是第 {times} 次买入该代币（连续 {consecutive} 天加仓）</b>\n\n"
+        f"<b>这是第 {times} 次买入该代币（连续 {consecutive_buy_days} 天加仓）{net_status}</b>\n\n"
         f"钱包: <code>{short_wallet}</code>\n"
         f"代币: {name} (${symbol})\n\n"
         f"当前价格: ${current_price:.8f}\n"
@@ -373,12 +581,14 @@ async def handle_buy(wallet: str, mint: str, token_amount: float, buy_ts: int,
 
     try:
         await bot.send_message(ADMIN_ID, text, parse_mode="HTML")
-        logger.info(f"通知成功: ${symbol} 第{times}次 | 连续{consecutive}天")
+        logger.info(f"通知成功: ${symbol} 第{times}次 | 连续{consecutive_buy_days}天")
     except Exception as e:
         logger.error(f"发送通知失败: {e}")
 
 
 def format_number(n: float) -> str:
+    if n is None:
+        return "0"
     if n >= 1_000_000:
         return f"{n/1_000_000:.2f}M"
     if n >= 1_000:
@@ -402,14 +612,16 @@ def format_age(seconds: int) -> str:
 @router.message(Command("help"), F.from_user.id == ADMIN_ID)
 async def cmd_help(message: Message):
     await message.answer(
-        "聪明钱跟踪 Bot（OKX版）\n\n"
+        "聪明钱跟踪 Bot（优化版 v2）\n\n"
         "/follow 钱包地址 - 开始跟踪\n"
         "/unfollow 钱包地址 - 取消跟踪\n"
         "/follows - 查看跟踪列表\n"
         "/followclear - 清空跟踪\n"
         "/list - 已通知代币总结\n"
+        "/flow 钱包地址 代币mint - 查看净流入详情\n"
         "/status - 运行状态\n"
-        "/help - 帮助"
+        "/help - 帮助\n\n"
+        f"当前设置：单笔买入 ≥ ${MIN_BUY_USD:.0f} 才通知"
     )
 
 
@@ -481,7 +693,7 @@ async def cmd_list(message: Message):
     conn = get_db()
     c = conn.cursor()
     c.execute("""
-        SELECT n.mint, t.symbol, COUNT(DISTINCT n.buy_date) as alert_count, 
+        SELECT n.mint, t.symbol, COUNT(DISTINCT n.buy_date) as alert_count,
                cb.total_tokens, cb.total_cost_usd
         FROM notified n
         LEFT JOIN token_info t ON n.mint = t.mint
@@ -494,12 +706,46 @@ async def cmd_list(message: Message):
     if not rows:
         await message.answer("暂无已通知记录")
         return
-    text = "已通知代币列表\n\n"
+
+    text = "<b>已通知代币列表</b>\n\n"
     for i, (mint, symbol, count, total_tokens, total_cost) in enumerate(rows, 1):
         symbol = symbol or "UNKNOWN"
         avg_cost = (total_cost / total_tokens) if total_tokens and total_tokens > 0 else 0
-        text += f"{i}. ${symbol}\n报警: {count}次 | 平均成本: ${avg_cost:.8f}\n\n"
-    await message.answer(text)
+        text += (
+            f"{i}. <b>${symbol}</b>\n"
+            f"报警: {count}次 | 平均成本: ${avg_cost:.8f}\n\n"
+        )
+    await message.answer(text, parse_mode="HTML")
+
+
+@router.message(Command("flow"), F.from_user.id == ADMIN_ID)
+async def cmd_flow(message: Message, command: CommandObject):
+    if not command.args:
+        await message.answer("用法: /flow 钱包地址 代币mint")
+        return
+    parts = command.args.strip().split()
+    if len(parts) < 2:
+        await message.answer("用法: /flow 钱包地址 代币mint")
+        return
+
+    wallet, mint = parts[0], parts[1]
+    flow_1d = get_net_flow_stats(wallet, mint, 1)
+    flow_3d = get_net_flow_stats(wallet, mint, 3)
+    flow_7d = get_net_flow_stats(wallet, mint, 7)
+    consecutive = get_consecutive_net_buy_days(wallet, mint)
+
+    text = (
+        f"📊 <b>净流入详情</b>\n\n"
+        f"钱包: <code>{wallet[:6]}...{wallet[-4:]}</code>\n"
+        f"代币: <code>{mint[:10]}...</code>\n\n"
+        f"今日净流入: <b>${flow_1d['net_usd']:+,.2f}</b>\n"
+        f"  买入 {flow_1d['buy_count']} 笔 / ${flow_1d['buy_usd']:,.0f}\n"
+        f"  卖出 {flow_1d['sell_count']} 笔 / ${flow_1d['sell_usd']:,.0f}\n\n"
+        f"3日净流入: <b>${flow_3d['net_usd']:+,.2f}</b>\n"
+        f"7日净流入: <b>${flow_7d['net_usd']:+,.2f}</b>\n"
+        f"连续净流入天数: <b>{consecutive} 天</b>"
+    )
+    await message.answer(text, parse_mode="HTML")
 
 
 @router.message(Command("status"), F.from_user.id == ADMIN_ID)
@@ -510,8 +756,18 @@ async def cmd_status(message: Message):
     wallet_count = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM notified")
     notify_count = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM buy_records")
+    buy_count = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM sell_records")
+    sell_count = c.fetchone()[0]
     conn.close()
-    await message.answer(f"运行正常（OKX版）\n跟踪地址数: {wallet_count}\n累计通知次数: {notify_count}")
+    await message.answer(
+        f"运行正常（优化版 v2）\n"
+        f"跟踪地址数: {wallet_count}\n"
+        f"累计通知次数: {notify_count}\n"
+        f"买入记录: {buy_count} | 卖出记录: {sell_count}\n"
+        f"单笔通知阈值: ≥ ${MIN_BUY_USD:.0f}"
+    )
 
 
 async def polling_loop():
@@ -523,7 +779,7 @@ async def polling_loop():
             wallets = [row[0] for row in c.fetchall()]
             conn.close()
             for wallet in wallets:
-                await process_new_buys(wallet)
+                await process_wallet(wallet)
                 await asyncio.sleep(2)
         except Exception as e:
             logger.error(f"轮询错误: {e}")
@@ -539,7 +795,7 @@ async def main():
         return
 
     init_db()
-    logger.info("Bot 启动中（OKX Web3 API 版本）...")
+    logger.info("Bot 启动中（优化版 v2 + 净流入）...")
     asyncio.create_task(polling_loop())
     await dp.start_polling(bot)
 
