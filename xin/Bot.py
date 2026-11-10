@@ -1,51 +1,55 @@
 import time
 import requests
 import json
-import os
-import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ====================== 配置区 ======================
-TELEGRAM_BOT_TOKEN = "8229035839:AAFfen2rHkpQB6hh1LW9cP8oYkQfoefcK_k"
-TELEGRAM_CHAT_ID = "1085273843"
+TELEGRAM_BOT_TOKEN = ""          # 必填
+TELEGRAM_CHAT_ID = ""            # 必填
 
-SCAN_INTERVAL = 90
-SEEN_FILE = "seen_pools.json"
-OBSERVE_FILE = "observe_pools.json"
-WATCH_FILE = "watch_list.json"
-ALERT_FILE = "alert_list.json"
+SCAN_INTERVAL = 90               # 主循环间隔（秒）
+AUTO_SCAN_INTERVAL = 300         # 自动扫描间隔（秒），建议 5 分钟
 
-ALERT_CHECK_INTERVAL = 180  # 个人提醒检查间隔（秒）= 3分钟
+BREAKOUT_WATCH_FILE = "breakout_watch.json"
+HISTORY_FILE = "price_history.json"
+ALERT_COOLDOWN_FILE = "alert_cooldown.json"
+AUTO_SCANNED_FILE = "auto_scanned.json"   # 记录已经自动扫描过的币，避免重复
 
-# ---------- 已放宽的过滤参数 ----------
-MIN_LIQUIDITY_USD = 15000       # 原25000 → 15000
-MIN_AGE_MINUTES = 5             # 原8 → 5
-MAX_AGE_MINUTES = 240           # 原180 → 240
-MIN_BUY_RATIO = 1.15            # 原1.25 → 1.15
-MAX_FDV_LIQ_RATIO = 25          # 原18 → 25
-MIN_BUYERS_M5 = 10              # 原15 → 10
-MIN_VOLUME_M5 = 5000            # 原8000 → 5000
-MIN_SCORE_TO_PUSH = 58          # 原68 → 58
-RECHECK_HOURS = [12, 24]
+# ====================== 策略参数（稳当版） ======================
+MIN_AGE_DAYS = 10
+MAX_AGE_DAYS = 1000
+HISTORY_KEEP_DAYS = 60
+
+CONSOL_HOURS = 36
+CONSOL_MAX_RANGE_PCT = 20
+VOL_SPIKE_MULT = 2.4
+MIN_VOL_H1 = 9000
+PRICE_BREAK_PCT = 12
+
+MIN_LIQ_BREAKOUT = 38000
+MAX_FDV_LIQ_RATIO = 16
+MIN_BUY_RATIO_M5 = 1.4
+
+MIN_SCORE_BREAKOUT = 70
+ALERT_COOLDOWN_HOURS = 5
+
+# 自动扫描开关
+ENABLE_AUTO_SCAN = True
+AUTO_ADD_TO_WATCH = False        # True = 自动加入监控列表，False = 只推送不加入
 # ====================================================
-
-GECKO_BASE = "https://api.geckoterminal.com/api/v2"
-GECKO_HEADERS = {
-    "Accept": "application/json;version=20230203",
-    "User-Agent": "Mozilla/5.0"
-}
 
 DEX_BASE = "https://api.dexscreener.com"
 DEX_HEADERS = {
     "Accept": "application/json",
-    "User-Agent": "Mozilla/5.0"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
 
 session = requests.Session()
-session.headers.update(GECKO_HEADERS)
+session.headers.update(DEX_HEADERS)
 
 last_update_id = 0
+last_auto_scan_time = 0
 
 def load_json(path):
     if Path(path).exists():
@@ -60,26 +64,13 @@ def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def format_mcap(value):
-    """市值格式化成 K / M"""
-    try:
-        value = float(value)
-        if value >= 1_000_000:
-            return f"{value/1_000_000:.2f}M"
-        elif value >= 1_000:
-            return f"{value/1_000:.1f}K"
-        else:
-            return f"{value:.0f}"
-    except:
-        return "0"
-
 def send_telegram(text, chat_id=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id or TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False
+        "disable_web_page_preview": True
     }
     try:
         session.post(url, json=payload, timeout=15)
@@ -89,281 +80,576 @@ def send_telegram(text, chat_id=None):
 def get_updates():
     global last_update_id
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"offset": last_update_id + 1, "timeout": 10}
+    params = {"offset": last_update_id + 1, "timeout": 8}
     try:
-        r = session.get(url, params=params, timeout=15)
+        r = session.get(url, params=params, timeout=12)
         if r.status_code == 200:
-            data = r.json()
-            return data.get("result", [])
+            return r.json().get("result", [])
     except:
         pass
     return []
 
-# ====================== DexScreener ======================
+# ====================== DexScreener 基础 ======================
 def fetch_token_info(token_address: str):
-    token_address = token_address.strip()
-    urls = [
-        f"{DEX_BASE}/latest/dex/tokens/{token_address}",
-        f"{DEX_BASE}/token-pairs/v1/solana/{token_address}",
-    ]
-    
-    for url in urls:
-        try:
-            r = session.get(url, headers=DEX_HEADERS, timeout=12)
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            
-            pairs = data.get("pairs") or data.get("pair") or []
-            if isinstance(pairs, dict):
-                pairs = [pairs]
-            if not pairs:
-                continue
-
-            sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
-            if not sol_pairs:
-                sol_pairs = pairs
-
-            best = max(sol_pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0) or 0))
-            
-            base = best.get("baseToken", {})
-            name = base.get("name") or "Unknown"
-            symbol = base.get("symbol") or ""
-            
-            # 优先取流通市值
-            mcap = float(best.get("marketCap") or best.get("fdv") or 0)
-            
-            return {
-                "name": f"{name} ({symbol})",
-                "symbol": symbol,
-                "price": float(best.get("priceUsd") or 0),
-                "fdv": mcap,
-                "liquidity": float(best.get("liquidity", {}).get("usd") or 0),
-                "pool_address": best.get("pairAddress", ""),
-                "url": best.get("url") or f"https://dexscreener.com/solana/{best.get('pairAddress', '')}",
-                "volume_24h": float(best.get("volume", {}).get("h24") or 0),
-                "price_change_24h": float(best.get("priceChange", {}).get("h24") or 0)
-            }
-        except Exception as e:
-            print(f"查询失败 {url}: {e}")
-            continue
-    return None
-
-def fetch_pool_by_address(pool_address: str):
-    url = f"{DEX_BASE}/latest/dex/pairs/solana/{pool_address}"
+    url = f"{DEX_BASE}/latest/dex/tokens/{token_address}"
     try:
         r = session.get(url, headers=DEX_HEADERS, timeout=12)
         if r.status_code != 200:
             return None
-        data = r.json()
-        pairs = data.get("pairs") or []
+        pairs = r.json().get("pairs") or []
         if not pairs:
             return None
-        return pairs[0]
+        sol_pairs = [p for p in pairs if p.get("chainId") == "solana"] or pairs
+        best = max(sol_pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0) or 0))
+        return parse_pair(best)
     except Exception as e:
-        print(f"获取池信息失败: {e}")
-    return None
+        print(f"fetch_token_info 失败: {e}")
+        return None
+
+def enrich_with_pair(token_address: str):
+    url = f"{DEX_BASE}/latest/dex/tokens/{token_address}"
+    try:
+        r = session.get(url, headers=DEX_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return None
+        pairs = r.json().get("pairs") or []
+        sol = [p for p in pairs if p.get("chainId") == "solana"] or pairs
+        if not sol:
+            return None
+        return max(sol, key=lambda x: float(x.get("liquidity", {}).get("usd", 0) or 0))
+    except:
+        return None
+
+def parse_pair(pair: dict):
+    try:
+        base = pair.get("baseToken", {})
+        name = f"{base.get('name', 'Unknown')} (${base.get('symbol', '')})"
+        token_address = base.get("address", "")
+        pool_address = pair.get("pairAddress", "")
+
+        liquidity = float(pair.get("liquidity", {}).get("usd") or 0)
+        fdv = float(pair.get("fdv") or 0)
+        price = float(pair.get("priceUsd") or 0)
+
+        txns = pair.get("txns", {}) or {}
+        m5 = txns.get("m5", {}) or {}
+        buys = int(m5.get("buys") or 0)
+        sells = int(m5.get("sells") or 0)
+
+        vol = pair.get("volume", {}) or {}
+        vol_m5 = float(vol.get("m5") or 0)
+        vol_h1 = float(vol.get("h1") or 0)
+        vol_h6 = float(vol.get("h6") or 0)
+        vol_h24 = float(vol.get("h24") or 0)
+
+        pc = pair.get("priceChange", {}) or {}
+        pc_h1 = float(pc.get("h1") or 0)
+        pc_h6 = float(pc.get("h6") or 0)
+        pc_h24 = float(pc.get("h24") or 0)
+
+        created = pair.get("pairCreatedAt")
+        age_days = 999.0
+        if created:
+            ct = datetime.fromtimestamp(created / 1000, tz=timezone.utc)
+            age_days = (datetime.now(timezone.utc) - ct).total_seconds() / 86400
+
+        return {
+            "name": name,
+            "symbol": base.get("symbol", ""),
+            "token_address": token_address,
+            "pool_address": pool_address,
+            "price": price,
+            "liquidity": liquidity,
+            "fdv": fdv,
+            "vol_m5": vol_m5,
+            "vol_h1": vol_h1,
+            "vol_h6": vol_h6,
+            "vol_h24": vol_h24,
+            "buys_m5": buys,
+            "sells_m5": sells,
+            "price_change_h1": pc_h1,
+            "price_change_h6": pc_h6,
+            "price_change_h24": pc_h24,
+            "age_days": age_days,
+            "url": pair.get("url") or f"https://dexscreener.com/solana/{pool_address}",
+            "pairCreatedAt": created
+        }
+    except Exception as e:
+        print(f"parse_pair 失败: {e}")
+        return None
+
+# ====================== 历史快照 ======================
+def update_price_history(watch_dict: dict):
+    history = load_json(HISTORY_FILE)
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=HISTORY_KEEP_DAYS)).isoformat()
+
+    for addr in list(watch_dict.keys()):
+        raw = enrich_with_pair(addr)
+        if not raw:
+            continue
+        p = parse_pair(raw)
+        if not p:
+            continue
+
+        if addr not in history:
+            history[addr] = []
+
+        entry = {
+            "ts": now.isoformat(),
+            "price": p["price"],
+            "liq": p["liquidity"],
+            "vol_m5": p["vol_m5"],
+            "vol_h1": p["vol_h1"],
+            "vol_h6": p["vol_h6"],
+            "buys_m5": p["buys_m5"],
+            "sells_m5": p["sells_m5"],
+            "fdv": p["fdv"]
+        }
+        history[addr].append(entry)
+        history[addr] = [h for h in history[addr] if h["ts"] > cutoff]
+
+    save_json(HISTORY_FILE, history)
+    return history
+
+# ====================== 策略 ======================
+def strategy_A_volume_price_break(hist: list, current: dict) -> dict:
+    if len(hist) < 8:
+        return {"score": 0, "reason": "历史不足"}
+
+    prices = [h["price"] for h in hist if h.get("price", 0) > 0]
+    vols = [h.get("vol_h1", 0) or h.get("vol_m5", 0) * 12 for h in hist]
+
+    if len(prices) < 6:
+        return {"score": 0, "reason": "数据不足"}
+
+    recent_high = max(prices[-20:]) if len(prices) >= 20 else max(prices)
+    avg_vol = sum(vols[:-3]) / max(len(vols) - 3, 1)
+    curr_vol = vols[-1] if vols else 0
+    curr_price = current.get("price", prices[-1])
+
+    vol_mult = curr_vol / avg_vol if avg_vol > 0 else 0
+    price_break = (curr_price - recent_high) / recent_high * 100 if recent_high > 0 else 0
+
+    score = 0
+    reasons = []
+
+    if vol_mult >= VOL_SPIKE_MULT:
+        score += 34
+        reasons.append(f"量放大{vol_mult:.1f}x")
+    elif vol_mult >= 1.8:
+        score += 14
+        reasons.append(f"量增{vol_mult:.1f}x")
+
+    if price_break >= PRICE_BREAK_PCT:
+        score += 40
+        reasons.append(f"突破高点+{price_break:.1f}%")
+    elif price_break > 7:
+        score += 16
+        reasons.append(f"接近突破+{price_break:.1f}%")
+
+    if current.get("liquidity", 0) >= MIN_LIQ_BREAKOUT:
+        score += 12
+
+    return {"score": min(score, 100), "reason": " | ".join(reasons) or "无强信号",
+            "vol_mult": round(vol_mult, 2), "price_break": round(price_break, 1)}
+
+def strategy_B_consolidation_then_spike(hist: list, current: dict) -> dict:
+    if len(hist) < 10:
+        return {"score": 0, "reason": "历史不足"}
+
+    now = datetime.now(timezone.utc)
+    consol_cutoff = (now - timedelta(hours=CONSOL_HOURS)).isoformat()
+    consol = [h for h in hist if h["ts"] >= consol_cutoff]
+
+    if len(consol) < 7:
+        return {"score": 0, "reason": "横盘窗口数据少"}
+
+    prices = [h["price"] for h in consol if h.get("price", 0) > 0]
+    if len(prices) < 5:
+        return {"score": 0, "reason": "价格数据不足"}
+
+    high, low = max(prices), min(prices)
+    range_pct = (high - low) / low * 100 if low > 0 else 999
+
+    vols = [h.get("vol_h1", 0) or h.get("vol_m5", 0) * 12 for h in consol]
+    avg_vol = sum(vols[:-2]) / max(len(vols) - 2, 1) if len(vols) > 2 else 0
+    curr_vol = sum(vols[-2:]) / 2 if len(vols) >= 2 else (vols[-1] if vols else 0)
+    vol_mult = curr_vol / avg_vol if avg_vol > 0 else 0
+
+    score = 0
+    reasons = []
+
+    if range_pct <= CONSOL_MAX_RANGE_PCT:
+        score += 36
+        reasons.append(f"横盘{range_pct:.1f}%")
+    else:
+        return {"score": 0, "reason": f"波动过大({range_pct:.1f}%)"}
+
+    if vol_mult >= VOL_SPIKE_MULT:
+        score += 42
+        reasons.append(f"量突增{vol_mult:.1f}x")
+    elif vol_mult >= 1.8:
+        score += 18
+        reasons.append(f"量增加{vol_mult:.1f}x")
+
+    last_price = prices[-1]
+    if last_price >= high * 0.96:
+        score += 12
+        reasons.append("接近/突破横盘高点")
+
+    if current.get("liquidity", 0) >= MIN_LIQ_BREAKOUT:
+        score += 8
+
+    return {"score": min(score, 100), "reason": " | ".join(reasons),
+            "range_pct": round(range_pct, 1), "vol_mult": round(vol_mult, 2)}
+
+def strategy_C_momentum_buys(current: dict) -> dict:
+    buys = current.get("buys_m5", 0)
+    sells = current.get("sells_m5", 0)
+    br = buys / max(sells, 1)
+    vol_m5 = current.get("vol_m5", 0)
+    pc_h1 = current.get("price_change_h1", 0) or 0
+
+    score = 0
+    reasons = []
+
+    if br >= 1.9 and buys >= 15:
+        score += 28
+        reasons.append(f"买压{br:.1f}")
+    elif br >= MIN_BUY_RATIO_M5:
+        score += 14
+        reasons.append(f"买压{br:.1f}")
+
+    if vol_m5 >= 10000:
+        score += 16
+        reasons.append(f"5m量${vol_m5:,.0f}")
+    elif vol_m5 >= 5000:
+        score += 8
+
+    if pc_h1 >= 6:
+        score += 18
+        reasons.append(f"1h涨{pc_h1:.1f}%")
+    elif pc_h1 >= 3:
+        score += 8
+
+    if current.get("liquidity", 0) >= MIN_LIQ_BREAKOUT:
+        score += 8
+
+    return {"score": min(score, 100), "reason": " | ".join(reasons) or "无强信号"}
+
+def strategy_D_combined(hist, current) -> dict:
+    a = strategy_A_volume_price_break(hist, current)
+    b = strategy_B_consolidation_then_spike(hist, current)
+    c = strategy_C_momentum_buys(current)
+    score = int(a["score"] * 0.27 + b["score"] * 0.48 + c["score"] * 0.25)
+    return {
+        "score": score,
+        "reason": f"A:{a['score']} B:{b['score']} C:{c['score']}",
+        "details": {"A": a, "B": b, "C": c}
+    }
+
+def hard_quality_filter(current: dict) -> bool:
+    if current.get("liquidity", 0) < MIN_LIQ_BREAKOUT:
+        return False
+    age = current.get("age_days", 999)
+    if age < MIN_AGE_DAYS or age > MAX_AGE_DAYS:
+        return False
+    if current.get("fdv", 0) > 0 and current.get("liquidity", 0) > 0:
+        if current["fdv"] / current["liquidity"] > MAX_FDV_LIQ_RATIO:
+            return False
+    if current.get("vol_h1", 0) < MIN_VOL_H1 and current.get("vol_m5", 0) * 12 < MIN_VOL_H1:
+        return False
+    buys = current.get("buys_m5", 0)
+    sells = current.get("sells_m5", 0)
+    if buys / max(sells, 1) < MIN_BUY_RATIO_M5 and buys < 10:
+        return False
+    if current.get("price_change_h6", 0) > 60:
+        return False
+    return True
+
+# ====================== 详细警报格式 ======================
+def format_alert(current: dict, results: dict, source: str = "监控"):
+    a = results["A"]
+    b = results["B"]
+    c = results["C"]
+    d = results["D"]
+    best = max(r["score"] for r in results.values())
+
+    buy_ratio = current["buys_m5"] / max(current["sells_m5"], 1)
+
+    msg = (
+        f"<b>🚀 底部启动信号</b>\n"
+        f"<i>来源：{source} | 综合得分 {best}</i>\n\n"
+        f"<b>代币：</b>{current['name']}\n"
+        f"<b>年龄：</b>{current['age_days']:.1f} 天\n"
+        f"<b>流动性：</b>${current['liquidity']:,.0f}\n"
+        f"<b>市值：</b>${current['fdv']:,.0f}\n"
+        f"<b>当前价格：</b>${current['price']:.8f}\n\n"
+        f"<b>策略详情：</b>\n"
+        f"A 量价突破：{a['score']} → {a['reason']}\n"
+        f"B 横盘启动：{b['score']} → {b['reason']}\n"
+        f"C 买压动量：{c['score']} → {c['reason']}\n"
+        f"D 综合：{d['score']}\n\n"
+        f"买压比：{buy_ratio:.2f} | 1h涨跌：{current.get('price_change_h1', 0):+.1f}%\n"
+        f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        f"合约：\n<code>{current['token_address']}</code>\n\n"
+        f"<a href='{current['url']}'>DexScreener</a>"
+    )
+    return msg
+
+# ====================== 自动扫描 ======================
+def fetch_latest_profiles():
+    """获取最新 token profiles（自动扫描来源之一）"""
+    url = f"{DEX_BASE}/token-profiles/latest/v1"
+    try:
+        r = session.get(url, headers=DEX_HEADERS, timeout=12)
+        if r.status_code == 200:
+            return r.json() or []
+    except Exception as e:
+        print(f"fetch_latest_profiles 失败: {e}")
+    return []
+
+def fetch_latest_boosts():
+    """获取最新 boosted tokens"""
+    url = f"{DEX_BASE}/token-boosts/latest/v1"
+    try:
+        r = session.get(url, headers=DEX_HEADERS, timeout=12)
+        if r.status_code == 200:
+            return r.json() or []
+    except Exception as e:
+        print(f"fetch_latest_boosts 失败: {e}")
+    return []
+
+def auto_scan():
+    """自动扫描逻辑"""
+    global last_auto_scan_time
+    now_ts = time.time()
+    if now_ts - last_auto_scan_time < AUTO_SCAN_INTERVAL:
+        return
+    last_auto_scan_time = now_ts
+
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 开始自动扫描...")
+
+    candidates = []
+    # 来源1：最新 profiles
+    for item in fetch_latest_profiles()[:30]:
+        addr = item.get("tokenAddress")
+        if addr:
+            candidates.append(addr)
+
+    # 来源2：最新 boosts
+    for item in fetch_latest_boosts()[:20]:
+        addr = item.get("tokenAddress")
+        if addr:
+            candidates.append(addr)
+
+    candidates = list(set(candidates))
+    print(f"自动扫描候选数量: {len(candidates)}")
+
+    auto_scanned = load_json(AUTO_SCANNED_FILE)
+    cooldown = load_json(ALERT_COOLDOWN_FILE)
+    history = load_json(HISTORY_FILE)
+    breakout_watch = load_json(BREAKOUT_WATCH_FILE)
+    now = datetime.now(timezone.utc)
+
+    for addr in candidates:
+        # 避免短时间重复扫描同一币
+        if addr in auto_scanned:
+            last = datetime.fromisoformat(auto_scanned[addr])
+            if (now - last).total_seconds() < 3600 * 6:  # 6小时内不重复
+                continue
+
+        raw = enrich_with_pair(addr)
+        if not raw:
+            continue
+        current = parse_pair(raw)
+        if not current or not hard_quality_filter(current):
+            continue
+
+        # 更新历史
+        if addr not in history:
+            history[addr] = []
+        history[addr].append({
+            "ts": now.isoformat(),
+            "price": current["price"],
+            "liq": current["liquidity"],
+            "vol_m5": current["vol_m5"],
+            "vol_h1": current["vol_h1"],
+            "vol_h6": current["vol_h6"],
+            "buys_m5": current["buys_m5"],
+            "sells_m5": current["sells_m5"],
+            "fdv": current["fdv"]
+        })
+        history[addr] = [h for h in history[addr] if h["ts"] > (now - timedelta(days=HISTORY_KEEP_DAYS)).isoformat()]
+
+        hist = history.get(addr, [])
+        results = {
+            "A": strategy_A_volume_price_break(hist, current),
+            "B": strategy_B_consolidation_then_spike(hist, current),
+            "C": strategy_C_momentum_buys(current),
+            "D": strategy_D_combined(hist, current)
+        }
+        best_score = max(r["score"] for r in results.values())
+
+        if best_score < MIN_SCORE_BREAKOUT:
+            continue
+
+        # 冷却
+        if addr in cooldown:
+            last_dt = datetime.fromisoformat(cooldown[addr])
+            if (now - last_dt).total_seconds() < ALERT_COOLDOWN_HOURS * 3600:
+                continue
+
+        # 发送警报
+        msg = format_alert(current, results, source="自动扫描")
+        send_telegram(msg)
+
+        cooldown[addr] = now.isoformat()
+        auto_scanned[addr] = now.isoformat()
+
+        # 是否自动加入监控
+        if AUTO_ADD_TO_WATCH and addr not in breakout_watch:
+            breakout_watch[addr] = {
+                "name": current["name"],
+                "added_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "source": "auto"
+            }
+
+        print(f"自动扫描命中: {current['name']} 得分 {best_score}")
+
+    save_json(HISTORY_FILE, history)
+    save_json(ALERT_COOLDOWN_FILE, cooldown)
+    save_json(AUTO_SCANNED_FILE, auto_scanned)
+    if AUTO_ADD_TO_WATCH:
+        save_json(BREAKOUT_WATCH_FILE, breakout_watch)
 
 # ====================== 命令处理 ======================
 def handle_command(text: str, chat_id: str):
     text = text.strip()
-    watch_list = load_json(WATCH_FILE)
+    breakout_watch = load_json(BREAKOUT_WATCH_FILE)
 
     if text.startswith("/start") or text.startswith("/help"):
         msg = (
-            "<b>🤖 新B-扫 机器人</b>\n\n"
-            "【自动扫描】\n"
-            "后台持续扫描新池，过滤后推送\n"
-            "并通过12h/24h复检二次提醒\n\n"
-            "【个人监控命令】\n"
-            "/watch 合约地址 - 添加监控\n"
-            "/unwatch 合约地址 - 删除监控\n"
-            "/list - 查看监控列表（含实时价格）\n"
-            "/price 合约地址 - 查看即时价格市值\n"
-            "/clear - 清空所有监控\n\n"
-            "【市值提醒】\n"
-            "/alert 合约地址 目标K - 设置市值提醒\n"
-            "/alerts - 查看当前提醒\n"
-            "/unalert 合约地址 - 取消提醒\n\n"
+            "<b>🤖 底部启动信号机器人</b>\n\n"
+            "功能：手动监控 + 自动扫描\n"
+            f"年龄范围：{MIN_AGE_DAYS} ~ {MAX_AGE_DAYS} 天\n"
+            f"最低流动性：${MIN_LIQ_BREAKOUT:,}\n\n"
+            "<b>命令：</b>\n"
+            "/bwatch 合约 - 手动加入监控\n"
+            "/bunwatch 合约 - 删除监控\n"
+            "/blist - 查看监控列表\n"
+            "/bclear - 清空监控\n"
+            "/price 合约 - 查看数据\n"
             "/status - 运行状态\n"
-            "/help - 显示帮助"
+            "/help"
         )
         send_telegram(msg, chat_id)
 
     elif text.startswith("/status"):
-        observe = load_json(OBSERVE_FILE)
-        alerts = load_json(ALERT_FILE)
+        history = load_json(HISTORY_FILE)
+        cooldown = load_json(ALERT_COOLDOWN_FILE)
+        auto_scanned = load_json(AUTO_SCANNED_FILE)
         msg = (
             f"<b>📊 运行状态</b>\n\n"
-            f"个人监控数量: {len(watch_list)}\n"
-            f"市值提醒数量: {len(alerts)}\n"
-            f"自动观察中: {len(observe)}\n"
-            f"当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            f"手动监控：{len(breakout_watch)}\n"
+            f"历史记录：{len(history)}\n"
+            f"冷却中：{len(cooldown)}\n"
+            f"已自动扫描：{len(auto_scanned)}\n"
+            f"自动扫描：{'开启' if ENABLE_AUTO_SCAN else '关闭'}\n"
+            f"年龄：{MIN_AGE_DAYS}~{MAX_AGE_DAYS}天\n"
+            f"最低流动性：${MIN_LIQ_BREAKOUT:,}\n"
+            f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         send_telegram(msg, chat_id)
 
-    elif text.startswith("/watch"):
+    elif text.startswith("/bwatch"):
         parts = text.split()
         if len(parts) < 2:
-            send_telegram("请使用格式：\n<code>/watch 合约地址</code>", chat_id)
+            send_telegram("格式：\n<code>/bwatch 合约地址</code>", chat_id)
             return
         addr = parts[1].strip()
         info = fetch_token_info(addr)
-        if info:
-            watch_list[addr] = {
-                "name": info["name"],
-                "added_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "pool_address": info.get("pool_address", "")
-            }
-            save_json(WATCH_FILE, watch_list)
-            send_telegram(
-                f"✅ 已添加监控\n\n"
-                f"<b>{info['name']}</b>\n"
-                f"价格: ${info['price']:.8f}\n"
-                f"流通市值: {format_mcap(info['fdv'])}\n"
-                f"流动性: {format_mcap(info['liquidity'])}",
-                chat_id
-            )
-        else:
-            send_telegram("❌ 未找到该代币，请检查合约地址是否正确", chat_id)
+        if not info:
+            send_telegram("❌ 未找到该代币", chat_id)
+            return
 
-    elif text.startswith("/unwatch"):
+        breakout_watch[addr] = {
+            "name": info["name"],
+            "added_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "source": "manual"
+        }
+        save_json(BREAKOUT_WATCH_FILE, breakout_watch)
+
+        tip = ""
+        if info["age_days"] < MIN_AGE_DAYS:
+            tip = f"\n⚠️ 年龄仅 {info['age_days']:.1f} 天，未达最低要求。"
+        elif info["liquidity"] < MIN_LIQ_BREAKOUT:
+            tip = f"\n⚠️ 流动性 ${info['liquidity']:,.0f} 低于门槛。"
+
+        send_telegram(
+            f"✅ 已加入监控\n\n"
+            f"<b>{info['name']}</b>\n"
+            f"年龄：{info['age_days']:.1f} 天\n"
+            f"流动性：${info['liquidity']:,.0f}\n"
+            f"市值：${info['fdv']:,.0f}\n"
+            f"价格：${info['price']:.8f}{tip}",
+            chat_id
+        )
+
+    elif text.startswith("/bunwatch"):
         parts = text.split()
         if len(parts) < 2:
-            send_telegram("请使用格式：\n<code>/unwatch 合约地址</code>", chat_id)
+            send_telegram("格式：\n<code>/bunwatch 合约地址</code>", chat_id)
             return
         addr = parts[1].strip()
-        if addr in watch_list:
-            name = watch_list[addr].get("name", addr)
-            del watch_list[addr]
-            save_json(WATCH_FILE, watch_list)
-            send_telegram(f"✅ 已删除监控：{name}", chat_id)
+        if addr in breakout_watch:
+            name = breakout_watch[addr].get("name", addr)
+            del breakout_watch[addr]
+            save_json(BREAKOUT_WATCH_FILE, breakout_watch)
+            send_telegram(f"✅ 已删除：{name}", chat_id)
         else:
-            send_telegram("该地址不在监控列表中", chat_id)
+            send_telegram("不在监控列表中", chat_id)
 
-    elif text.startswith("/list"):
-        if not watch_list:
+    elif text.startswith("/blist"):
+        if not breakout_watch:
             send_telegram("当前没有监控任何代币", chat_id)
             return
-        
         msg = "<b>📋 当前监控列表</b>\n\n"
-        for i, (addr, info) in enumerate(watch_list.items(), 1):
-            live = fetch_token_info(addr)
-            if live:
-                price = live["price"]
-                mcap = live["fdv"]
-                price_str = f"${price:.8f}" if price < 0.01 else f"${price:.6f}"
-                msg += (
-                    f"{i}. <b>{info.get('name', 'Unknown')}</b>\n"
-                    f"<code>{addr}</code>\n"
-                    f"价格: <b>{price_str}</b> | 流通市值: {format_mcap(mcap)}\n"
-                    f"添加时间: {info.get('added_at', '-')}\n\n"
-                )
-            else:
-                msg += (
-                    f"{i}. <b>{info.get('name', 'Unknown')}</b>\n"
-                    f"<code>{addr}</code>\n"
-                    f"价格: 获取失败\n"
-                    f"添加时间: {info.get('added_at', '-')}\n\n"
-                )
-        
-        if len(msg) > 4000:
-            msg = msg[:3900] + "\n\n...（列表过长，已截断）"
+        for i, (addr, info) in enumerate(breakout_watch.items(), 1):
+            src = info.get("source", "manual")
+            msg += f"{i}. <b>{info.get('name')}</b> ({src})\n<code>{addr}</code>\n添加：{info.get('added_at')}\n\n"
         send_telegram(msg, chat_id)
+
+    elif text.startswith("/bclear"):
+        save_json(BREAKOUT_WATCH_FILE, {})
+        send_telegram("✅ 已清空所有监控", chat_id)
 
     elif text.startswith("/price"):
         parts = text.split()
         if len(parts) < 2:
-            send_telegram("请使用格式：\n<code>/price 合约地址</code>", chat_id)
+            send_telegram("格式：\n<code>/price 合约地址</code>", chat_id)
             return
         addr = parts[1].strip()
         info = fetch_token_info(addr)
         if info:
-            change = info.get("price_change_24h", 0)
+            change = info.get("price_change_h24", 0)
             change_str = f"+{change:.1f}%" if change >= 0 else f"{change:.1f}%"
             send_telegram(
                 f"<b>{info['name']}</b>\n\n"
-                f"价格: <b>${info['price']:.8f}</b>\n"
-                f"流通市值: <b>{format_mcap(info['fdv'])}</b>\n"
-                f"流动性: {format_mcap(info['liquidity'])}\n"
-                f"24h涨跌: {change_str}\n"
-                f"24h成交: {format_mcap(info.get('volume_24h', 0))}\n\n"
-                f"<a href='{info['url']}'>DexScreener 查看</a>",
+                f"价格：<b>${info['price']:.8f}</b>\n"
+                f"市值：<b>${info['fdv']:,.0f}</b>\n"
+                f"流动性：${info['liquidity']:,.0f}\n"
+                f"24h涨跌：{change_str}\n"
+                f"年龄：<b>{info['age_days']:.1f} 天</b>\n\n"
+                f"<a href='{info['url']}'>DexScreener</a>",
                 chat_id
             )
         else:
-            send_telegram("❌ 获取失败，请检查合约地址", chat_id)
-
-    elif text.startswith("/clear"):
-        save_json(WATCH_FILE, {})
-        send_telegram("✅ 已清空所有个人监控", chat_id)
-
-    elif text.startswith("/alert"):
-        parts = text.split()
-        if len(parts) < 3:
-            send_telegram("请使用格式：\n<code>/alert 合约地址 目标市值K</code>\n例如：/alert xxxxx 1000  （表示1000K=100万）", chat_id)
-            return
-        addr = parts[1].strip()
-        try:
-            target_k = float(parts[2])
-        except:
-            send_telegram("目标市值请输入数字（单位是K）", chat_id)
-            return
-        
-        info = fetch_token_info(addr)
-        if not info:
-            send_telegram("❌ 未找到该代币，请检查合约地址", chat_id)
-            return
-        
-        alerts = load_json(ALERT_FILE)
-        alerts[addr] = {
-            "name": info["name"],
-            "target_k": target_k,
-            "target_usd": target_k * 1000,
-            "added_at": datetime.now().strftime("%Y-%m-%d %H:%M")
-        }
-        save_json(ALERT_FILE, alerts)
-        
-        send_telegram(
-            f"✅ 已设置市值提醒\n\n"
-            f"<b>{info['name']}</b>\n"
-            f"当前流通市值: {format_mcap(info['fdv'])}\n"
-            f"目标市值: <b>{target_k}K</b>（{format_mcap(target_k*1000)}）\n"
-            f"达到后将提醒你一次",
-            chat_id
-        )
-
-    elif text.startswith("/alerts"):
-        alerts = load_json(ALERT_FILE)
-        if not alerts:
-            send_telegram("当前没有设置任何市值提醒", chat_id)
-            return
-        msg = "<b>🔔 当前市值提醒</b>\n\n"
-        for i, (addr, info) in enumerate(alerts.items(), 1):
-            msg += (
-                f"{i}. <b>{info.get('name', 'Unknown')}</b>\n"
-                f"目标: <b>{info.get('target_k')}K</b>\n"
-                f"<code>{addr}</code>\n\n"
-            )
-        send_telegram(msg, chat_id)
-
-    elif text.startswith("/unalert"):
-        parts = text.split()
-        if len(parts) < 2:
-            send_telegram("请使用格式：\n<code>/unalert 合约地址</code>", chat_id)
-            return
-        addr = parts[1].strip()
-        alerts = load_json(ALERT_FILE)
-        if addr in alerts:
-            name = alerts[addr].get("name", addr)
-            del alerts[addr]
-            save_json(ALERT_FILE, alerts)
-            send_telegram(f"✅ 已取消提醒：{name}", chat_id)
-        else:
-            send_telegram("该地址没有设置提醒", chat_id)
+            send_telegram("❌ 获取失败", chat_id)
 
     else:
-        send_telegram("未知命令，请输入 /help 查看支持的命令", chat_id)
+        send_telegram("未知命令，请输入 /help", chat_id)
 
 def process_telegram_commands():
     global last_update_id
@@ -373,290 +659,69 @@ def process_telegram_commands():
         message = update.get("message", {})
         chat_id = str(message.get("chat", {}).get("id", ""))
         text = message.get("text", "")
-        if str(chat_id) == str(TELEGRAM_CHAT_ID) and text.startswith("/"):
+        if chat_id == TELEGRAM_CHAT_ID and text.startswith("/"):
             handle_command(text, chat_id)
 
-def check_alerts():
-    """检查个人市值提醒是否达标"""
-    alerts = load_json(ALERT_FILE)
-    if not alerts:
-        return
-    
-    to_remove = []
-    for addr, info in list(alerts.items()):
-        live = fetch_token_info(addr)
-        if not live:
-            continue
-        current_mcap = live["fdv"]
-        target = info.get("target_usd", 0)
-        
-        if current_mcap >= target:
-            send_telegram(
-                f"🔔 <b>市值提醒触发</b>\n\n"
-                f"<b>{info.get('name', 'Unknown')}</b>\n"
-                f"当前流通市值: <b>{format_mcap(current_mcap)}</b>\n"
-                f"已达到你设置的目标 {info.get('target_k')}K\n\n"
-                f"<code>{addr}</code>"
-            )
-            to_remove.append(addr)
-    
-    for addr in to_remove:
-        alerts.pop(addr, None)
-    if to_remove:
-        save_json(ALERT_FILE, alerts)
-
-# ------------------- 扫描逻辑 -------------------
-def fetch_new_pools(pages=2):
-    all_pools = []
-    for page in range(1, pages + 1):
-        url = f"{GECKO_BASE}/networks/solana/new_pools"
-        params = {"page": page}
-        try:
-            r = session.get(url, params=params, headers=GECKO_HEADERS, timeout=12)
-            if r.status_code == 200:
-                all_pools.extend(r.json().get("data", []))
-        except:
-            pass
-        time.sleep(1.1)
-    return all_pools
-
-def parse_pool_gecko(pool):
-    try:
-        attr = pool.get("attributes", {})
-        rel = pool.get("relationships", {})
-        name = attr.get("name", "Unknown")
-        pool_address = attr.get("address", "")
-        base_token = ""
-        if "base_token" in rel:
-            base_token = rel["base_token"]["data"]["id"].split("_")[-1]
-
-        liquidity = float(attr.get("reserve_in_usd", 0) or 0)
-        fdv = float(attr.get("fdv_usd", 0) or 0)
-        vol_m5 = float(attr.get("volume_usd", {}).get("m5", 0) or 0)
-        m5 = attr.get("transactions", {}).get("m5", {})
-        buys = int(m5.get("buys", 0) or 0)
-        sells = int(m5.get("sells", 0) or 0)
-        buyers = int(m5.get("buyers", 0) or 0)
-
-        created = attr.get("pool_created_at")
-        age = 999
-        if created:
-            ct = datetime.fromisoformat(created.replace("Z", "+00:00"))
-            age = (datetime.now(timezone.utc) - ct).total_seconds() / 60
-
-        return {
-            "name": name,
-            "pool_address": pool_address,
-            "token_address": base_token,
-            "liquidity": liquidity,
-            "fdv": fdv,
-            "vol_m5": vol_m5,
-            "buys_m5": buys,
-            "sells_m5": sells,
-            "buyers_m5": buyers,
-            "age_minutes": age,
-            "url": f"https://dexscreener.com/solana/{pool_address}"
-        }
-    except:
-        return None
-
-def parse_pool_dex(pair):
-    try:
-        base = pair.get("baseToken", {})
-        name = f"{base.get('name', 'Unknown')} ({base.get('symbol', '')})"
-        pool_address = pair.get("pairAddress", "")
-        token_address = base.get("address", "")
-
-        liquidity = float(pair.get("liquidity", {}).get("usd") or 0)
-        fdv = float(pair.get("marketCap") or pair.get("fdv") or 0)
-        
-        txns = pair.get("txns", {}).get("m5", {})
-        buys = int(txns.get("buys") or 0)
-        sells = int(txns.get("sells") or 0)
-        buyers = buys
-        
-        vol_m5 = float(pair.get("volume", {}).get("m5") or 0)
-
-        created = pair.get("pairCreatedAt")
-        age = 999
-        if created:
-            ct = datetime.fromtimestamp(created / 1000, tz=timezone.utc)
-            age = (datetime.now(timezone.utc) - ct).total_seconds() / 60
-
-        return {
-            "name": name,
-            "pool_address": pool_address,
-            "token_address": token_address,
-            "liquidity": liquidity,
-            "fdv": fdv,
-            "vol_m5": vol_m5,
-            "buys_m5": buys,
-            "sells_m5": sells,
-            "buyers_m5": buyers,
-            "age_minutes": age,
-            "url": pair.get("url") or f"https://dexscreener.com/solana/{pool_address}"
-        }
-    except:
-        return None
-
-def hard_filter(p):
-    if not p or p["liquidity"] < MIN_LIQUIDITY_USD: return False
-    if p["age_minutes"] < MIN_AGE_MINUTES or p["age_minutes"] > MAX_AGE_MINUTES: return False
-    if p["buyers_m5"] < MIN_BUYERS_M5 or p["vol_m5"] < MIN_VOLUME_M5: return False
-    if p["buys_m5"] / max(p["sells_m5"], 1) < MIN_BUY_RATIO: return False
-    if p["fdv"] > 0 and p["liquidity"] > 0 and p["fdv"] / p["liquidity"] > MAX_FDV_LIQ_RATIO: return False
-    return True
-
-def score_pool(p):
-    score = 0
-    liq = p["liquidity"]
-    if liq >= 80000: score += 22
-    elif liq >= 50000: score += 18
-    elif liq >= 30000: score += 14
-    elif liq >= 15000: score += 10
-    br = p["buys_m5"] / max(p["sells_m5"], 1)
-    if br >= 2.0: score += 18
-    elif br >= 1.5: score += 14
-    elif br >= 1.15: score += 10
-    if p["buyers_m5"] >= 40: score += 12
-    elif p["buyers_m5"] >= 25: score += 9
-    elif p["buyers_m5"] >= 10: score += 6
-    if p["vol_m5"] >= 30000: score += 12
-    elif p["vol_m5"] >= 15000: score += 9
-    elif p["vol_m5"] >= 5000: score += 6
-    if p["fdv"] > 0 and p["liquidity"] > 0:
-        r = p["fdv"] / p["liquidity"]
-        if r <= 8: score += 12
-        elif r <= 15: score += 8
-        elif r <= 25: score += 4
-    return min(score, 90)
-
-def is_still_healthy(old, new):
-    if not new: return False
-    if new["liquidity"] < old["liquidity"] * 0.7: return False
-    if new["vol_m5"] < 3000: return False
-    if new["buys_m5"] / max(new["sells_m5"], 1) < 0.8: return False
-    return True
-
-def format_primary(p, score):
-    br = p["buys_m5"] / max(p["sells_m5"], 1)
-    return (
-        f"<b>🚀 初级提醒 | {score}/90</b>\n\n"
-        f"<b>{p['name']}</b>\n"
-        f"流动性: <b>{format_mcap(p['liquidity'])}</b>\n"
-        f"市值: {format_mcap(p['fdv'])}\n"
-        f"年龄: {p['age_minutes']:.1f}分钟\n"
-        f"买/卖: {p['buys_m5']}/{p['sells_m5']} | 买家{p['buyers_m5']}\n"
-        f"买/卖比: <b>{br:.2f}</b>\n"
-        f"5m成交: {format_mcap(p['vol_m5'])}\n\n"
-        f"<a href='{p['url']}'>DexScreener</a>\n"
-        f"<code>{p['pool_address']}</code>"
+# ====================== 主循环 ======================
+def main_loop():
+    print("底部启动信号机器人启动中（手动监控 + 自动扫描）...")
+    send_telegram(
+        "🤖 机器人已启动\n"
+        "模式：手动监控 + 自动扫描\n"
+        f"年龄范围：{MIN_AGE_DAYS} ~ {MAX_AGE_DAYS} 天\n"
+        f"最低流动性：${MIN_LIQ_BREAKOUT:,}\n"
+        "警报标题：底部启动信号\n"
+        "发送 /help 查看命令"
     )
 
-def format_recheck(p, hours, old_liq):
-    chg = ((p["liquidity"] - old_liq) / old_liq * 100) if old_liq else 0
-    return (
-        f"<b>✅ 二次确认 | {hours}h复检通过</b>\n\n"
-        f"<b>{p['name']}</b>\n"
-        f"流动性: <b>{format_mcap(p['liquidity'])}</b> ({chg:+.1f}%)\n"
-        f"市值: {format_mcap(p['fdv'])}\n"
-        f"<a href='{p['url']}'>查看</a>"
-    )
-
-def command_loop():
-    last_alert_check = 0
     while True:
         try:
             process_telegram_commands()
-            
-            now = time.time()
-            if now - last_alert_check >= ALERT_CHECK_INTERVAL:
-                check_alerts()
-                last_alert_check = now
-                
-            time.sleep(2)
-        except Exception as e:
-            print(f"命令处理异常: {e}")
-            time.sleep(5)
 
-def main_loop():
-    print("机器人启动中（Gecko发现 + DexScreener精准数据）...")
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("警告：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未设置！")
-    
-    send_telegram("🤖 机器人已启动（过滤条件已放宽）\n发送 /help 查看可用命令")
+            # 1. 处理手动监控列表
+            breakout_watch = load_json(BREAKOUT_WATCH_FILE)
+            if breakout_watch:
+                history = update_price_history(breakout_watch)
+                cooldown = load_json(ALERT_COOLDOWN_FILE)
+                now = datetime.now(timezone.utc)
 
-    t = threading.Thread(target=command_loop, daemon=True)
-    t.start()
-
-    seen = set(load_json(SEEN_FILE)) if isinstance(load_json(SEEN_FILE), list) else set()
-    observe = load_json(OBSERVE_FILE)
-
-    while True:
-        try:
-            pools = fetch_new_pools(pages=2)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 扫描到 {len(pools)} 个新池")
-
-            for pool in pools:
-                p = parse_pool_gecko(pool)
-                if not p or p["pool_address"] in seen: continue
-                if not hard_filter(p): continue
-                score = score_pool(p)
-                if score >= MIN_SCORE_TO_PUSH:
-                    # 二次确认：用 DexScreener 检查真实流动性
-                    real_liq = 0
-                    real_name = p["name"]
-                    
-                    if p.get("token_address"):
-                        live_info = fetch_token_info(p["token_address"])
-                        if live_info:
-                            real_liq = live_info.get("liquidity", 0)
-                            real_name = live_info.get("name", p["name"])
-                    
-                    # 真实流动性不达标，直接跳过
-                    if real_liq < MIN_LIQUIDITY_USD:
-                        print(f"跳过 {p['name']}，真实流动性只有 ${real_liq:.0f}")
-                        seen.add(p["pool_address"])
+                for addr in list(breakout_watch.keys()):
+                    raw = enrich_with_pair(addr)
+                    if not raw:
                         continue
-                    
-                    # 用真实数据更新一下
-                    p["liquidity"] = real_liq
-                    p["name"] = real_name
-                    
-                    # 流动性合格才推送
-                    send_telegram(format_primary(p, score))
-                    observe[p["pool_address"]] = {
-                        "first_seen": datetime.now(timezone.utc).isoformat(),
-                        "name": p["name"],
-                        "liquidity": real_liq,
-                        "rechecks_done": []
+                    current = parse_pair(raw)
+                    if not current or not hard_quality_filter(current):
+                        continue
+
+                    hist = history.get(addr, [])
+                    results = {
+                        "A": strategy_A_volume_price_break(hist, current),
+                        "B": strategy_B_consolidation_then_spike(hist, current),
+                        "C": strategy_C_momentum_buys(current),
+                        "D": strategy_D_combined(hist, current)
                     }
-                    seen.add(p["pool_address"])
+                    best_score = max(r["score"] for r in results.values())
+                    if best_score < MIN_SCORE_BREAKOUT:
+                        continue
 
-            save_json(SEEN_FILE, list(seen))
-            save_json(OBSERVE_FILE, observe)
+                    if addr in cooldown:
+                        last_dt = datetime.fromisoformat(cooldown[addr])
+                        if (now - last_dt).total_seconds() < ALERT_COOLDOWN_HOURS * 3600:
+                            continue
 
-            now = datetime.now(timezone.utc)
-            for addr, info in list(observe.items()):
-                first = datetime.fromisoformat(info["first_seen"])
-                hours = (now - first).total_seconds() / 3600
-                for h in RECHECK_HOURS:
-                    if h in info.get("rechecks_done", []): continue
-                    if hours >= h:
-                        raw = fetch_pool_by_address(addr)
-                        if raw:
-                            np = parse_pool_dex(raw)
-                            if np and is_still_healthy(info, np):
-                                send_telegram(format_recheck(np, h, info["liquidity"]))
-                        info.setdefault("rechecks_done", []).append(h)
-                        observe[addr] = info
-                if hours > max(RECHECK_HOURS) + 6:
-                    observe.pop(addr, None)
-            save_json(OBSERVE_FILE, observe)
+                    msg = format_alert(current, results, source="手动监控")
+                    send_telegram(msg)
+                    cooldown[addr] = now.isoformat()
+                    save_json(ALERT_COOLDOWN_FILE, cooldown)
+
+            # 2. 自动扫描
+            if ENABLE_AUTO_SCAN:
+                auto_scan()
 
             time.sleep(SCAN_INTERVAL)
+
         except Exception as e:
-            print(f"异常: {e}")
+            print(f"主循环异常: {e}")
             time.sleep(30)
 
 if __name__ == "__main__":
