@@ -79,9 +79,9 @@ def send_telegram(text, chat_id=None):
 def get_updates():
     global last_update_id
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"offset": last_update_id + 1, "timeout": 8}
+    params = {"offset": last_update_id + 1, "timeout": 5}
     try:
-        r = session.get(url, params=params, timeout=12)
+        r = session.get(url, params=params, timeout=10)
         if r.status_code == 200:
             return r.json().get("result", [])
     except:
@@ -397,7 +397,7 @@ def format_alert(current: dict, results: dict, source: str = "监控"):
     )
     return msg
 
-# ====================== 自动扫描 ======================
+# ====================== 自动扫描（已优化命令响应） ======================
 def fetch_latest_profiles():
     url = f"{DEX_BASE}/token-profiles/latest/v1"
     try:
@@ -446,7 +446,11 @@ def auto_scan():
     breakout_watch = load_json(BREAKOUT_WATCH_FILE)
     now = datetime.now(timezone.utc)
 
-    for addr in candidates:
+    for i, addr in enumerate(candidates):
+        # 每处理 6 个币就检查一次命令，提高响应速度
+        if i > 0 and i % 6 == 0:
+            process_telegram_commands()
+
         if addr in auto_scanned:
             last = datetime.fromisoformat(auto_scanned[addr])
             if (now - last).total_seconds() < 3600 * 6:
@@ -684,7 +688,7 @@ def process_telegram_commands():
         if chat_id == TELEGRAM_CHAT_ID and text.startswith("/"):
             handle_command(text, chat_id)
 
-# ====================== 主循环 ======================
+# ====================== 主循环（已优化命令响应速度） ======================
 def main_loop():
     print("底部启动信号机器人启动中（手动监控 + 自动扫描）...")
     send_telegram(
@@ -698,6 +702,7 @@ def main_loop():
 
     while True:
         try:
+            # 优先处理命令
             process_telegram_commands()
 
             # 手动监控
@@ -740,11 +745,16 @@ def main_loop():
             if ENABLE_AUTO_SCAN:
                 auto_scan()
 
-            time.sleep(SCAN_INTERVAL)
+            # 提高命令响应速度：多检查几次命令
+            for _ in range(4):
+                process_telegram_commands()
+                time.sleep(1.5)
+
+            time.sleep(max(SCAN_INTERVAL - 6, 5))
 
         except Exception as e:
             print(f"主循环异常: {e}")
-            time.sleep(30)
+            time.sleep(15)
 
 if __name__ == "__main__":
     main_loop()
