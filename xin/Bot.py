@@ -5,8 +5,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ====================== 配置区 ======================
-TELEGRAM_BOT_TOKEN = ""          # 必填
-TELEGRAM_CHAT_ID = ""            # 必填
+TELEGRAM_BOT_TOKEN = "8229035839:AAFfen2rHkpQB6hh1LW9cP8oYkQfoefcK_k"          # 必填
+TELEGRAM_CHAT_ID = "1085273843"            # 必填
 
 SCAN_INTERVAL = 90               # 主循环间隔（秒）
 AUTO_SCAN_INTERVAL = 300         # 自动扫描间隔（秒），建议 5 分钟
