@@ -9,12 +9,12 @@ TELEGRAM_BOT_TOKEN = "8229035839:AAFfen2rHkpQB6hh1LW9cP8oYkQfoefcK_k"          #
 TELEGRAM_CHAT_ID = "1085273843"            # 必填
 
 SCAN_INTERVAL = 90               # 主循环间隔（秒）
-AUTO_SCAN_INTERVAL = 300         # 自动扫描间隔（秒），建议 5 分钟
+AUTO_SCAN_INTERVAL = 300         # 自动扫描间隔（秒）
 
 BREAKOUT_WATCH_FILE = "breakout_watch.json"
 HISTORY_FILE = "price_history.json"
 ALERT_COOLDOWN_FILE = "alert_cooldown.json"
-AUTO_SCANNED_FILE = "auto_scanned.json"   # 记录已经自动扫描过的币，避免重复
+AUTO_SCANNED_FILE = "auto_scanned.json"
 
 # ====================== 策略参数（稳当版） ======================
 MIN_AGE_DAYS = 10
@@ -34,9 +34,8 @@ MIN_BUY_RATIO_M5 = 1.4
 MIN_SCORE_BREAKOUT = 70
 ALERT_COOLDOWN_HOURS = 5
 
-# 自动扫描开关
 ENABLE_AUTO_SCAN = True
-AUTO_ADD_TO_WATCH = False        # True = 自动加入监控列表，False = 只推送不加入
+AUTO_ADD_TO_WATCH = False
 # ====================================================
 
 DEX_BASE = "https://api.dexscreener.com"
@@ -89,7 +88,7 @@ def get_updates():
         pass
     return []
 
-# ====================== DexScreener 基础 ======================
+# ====================== DexScreener ======================
 def fetch_token_info(token_address: str):
     url = f"{DEX_BASE}/latest/dex/tokens/{token_address}"
     try:
@@ -400,7 +399,6 @@ def format_alert(current: dict, results: dict, source: str = "监控"):
 
 # ====================== 自动扫描 ======================
 def fetch_latest_profiles():
-    """获取最新 token profiles（自动扫描来源之一）"""
     url = f"{DEX_BASE}/token-profiles/latest/v1"
     try:
         r = session.get(url, headers=DEX_HEADERS, timeout=12)
@@ -411,7 +409,6 @@ def fetch_latest_profiles():
     return []
 
 def fetch_latest_boosts():
-    """获取最新 boosted tokens"""
     url = f"{DEX_BASE}/token-boosts/latest/v1"
     try:
         r = session.get(url, headers=DEX_HEADERS, timeout=12)
@@ -422,7 +419,6 @@ def fetch_latest_boosts():
     return []
 
 def auto_scan():
-    """自动扫描逻辑"""
     global last_auto_scan_time
     now_ts = time.time()
     if now_ts - last_auto_scan_time < AUTO_SCAN_INTERVAL:
@@ -432,13 +428,10 @@ def auto_scan():
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 开始自动扫描...")
 
     candidates = []
-    # 来源1：最新 profiles
     for item in fetch_latest_profiles()[:30]:
         addr = item.get("tokenAddress")
         if addr:
             candidates.append(addr)
-
-    # 来源2：最新 boosts
     for item in fetch_latest_boosts()[:20]:
         addr = item.get("tokenAddress")
         if addr:
@@ -454,10 +447,9 @@ def auto_scan():
     now = datetime.now(timezone.utc)
 
     for addr in candidates:
-        # 避免短时间重复扫描同一币
         if addr in auto_scanned:
             last = datetime.fromisoformat(auto_scanned[addr])
-            if (now - last).total_seconds() < 3600 * 6:  # 6小时内不重复
+            if (now - last).total_seconds() < 3600 * 6:
                 continue
 
         raw = enrich_with_pair(addr)
@@ -467,7 +459,6 @@ def auto_scan():
         if not current or not hard_quality_filter(current):
             continue
 
-        # 更新历史
         if addr not in history:
             history[addr] = []
         history[addr].append({
@@ -495,20 +486,17 @@ def auto_scan():
         if best_score < MIN_SCORE_BREAKOUT:
             continue
 
-        # 冷却
         if addr in cooldown:
             last_dt = datetime.fromisoformat(cooldown[addr])
             if (now - last_dt).total_seconds() < ALERT_COOLDOWN_HOURS * 3600:
                 continue
 
-        # 发送警报
         msg = format_alert(current, results, source="自动扫描")
         send_telegram(msg)
 
         cooldown[addr] = now.isoformat()
         auto_scanned[addr] = now.isoformat()
 
-        # 是否自动加入监控
         if AUTO_ADD_TO_WATCH and addr not in breakout_watch:
             breakout_watch[addr] = {
                 "name": current["name"],
@@ -538,8 +526,10 @@ def handle_command(text: str, chat_id: str):
             "<b>命令：</b>\n"
             "/bwatch 合约 - 手动加入监控\n"
             "/bunwatch 合约 - 删除监控\n"
-            "/blist - 查看监控列表\n"
-            "/bclear - 清空监控\n"
+            "/blist - 查看当前监控列表\n"
+            "/bclear - 清空监控列表\n"
+            "/list - 已通知代币总结\n"
+            "/clist - 清除已通知记录\n"
             "/price 合约 - 查看数据\n"
             "/status - 运行状态\n"
             "/help"
@@ -554,7 +544,7 @@ def handle_command(text: str, chat_id: str):
             f"<b>📊 运行状态</b>\n\n"
             f"手动监控：{len(breakout_watch)}\n"
             f"历史记录：{len(history)}\n"
-            f"冷却中：{len(cooldown)}\n"
+            f"已通知：{len(cooldown)}\n"
             f"已自动扫描：{len(auto_scanned)}\n"
             f"自动扫描：{'开启' if ENABLE_AUTO_SCAN else '关闭'}\n"
             f"年龄：{MIN_AGE_DAYS}~{MAX_AGE_DAYS}天\n"
@@ -625,6 +615,38 @@ def handle_command(text: str, chat_id: str):
         save_json(BREAKOUT_WATCH_FILE, {})
         send_telegram("✅ 已清空所有监控", chat_id)
 
+    elif text.startswith("/list"):
+        cooldown = load_json(ALERT_COOLDOWN_FILE)
+        if not cooldown:
+            send_telegram("目前还没有已通知的代币", chat_id)
+            return
+
+        sorted_items = sorted(cooldown.items(), key=lambda x: x[1], reverse=True)
+
+        msg = "<b>📋 已通知代币总结</b>\n\n"
+        for i, (addr, ts) in enumerate(sorted_items[:25], 1):
+            name = addr[:8] + "..." + addr[-6:]
+            try:
+                info = fetch_token_info(addr)
+                if info and info.get("name"):
+                    name = info["name"]
+            except:
+                pass
+
+            time_str = ts.replace("T", " ")[:16]
+            msg += f"{i}. <b>{name}</b>\n"
+            msg += f"   时间：{time_str}\n"
+            msg += f"   <code>{addr}</code>\n\n"
+
+        if len(sorted_items) > 25:
+            msg += f"... 还有 {len(sorted_items)-25} 个未显示"
+
+        send_telegram(msg, chat_id)
+
+    elif text.startswith("/clist"):
+        save_json(ALERT_COOLDOWN_FILE, {})
+        send_telegram("✅ 已清除所有「已通知」记录", chat_id)
+
     elif text.startswith("/price"):
         parts = text.split()
         if len(parts) < 2:
@@ -678,7 +700,7 @@ def main_loop():
         try:
             process_telegram_commands()
 
-            # 1. 处理手动监控列表
+            # 手动监控
             breakout_watch = load_json(BREAKOUT_WATCH_FILE)
             if breakout_watch:
                 history = update_price_history(breakout_watch)
@@ -714,7 +736,7 @@ def main_loop():
                     cooldown[addr] = now.isoformat()
                     save_json(ALERT_COOLDOWN_FILE, cooldown)
 
-            # 2. 自动扫描
+            # 自动扫描
             if ENABLE_AUTO_SCAN:
                 auto_scan()
 
